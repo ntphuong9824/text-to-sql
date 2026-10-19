@@ -1,6 +1,7 @@
 package com.fsoft.training.support;
 
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -13,6 +14,7 @@ import org.testcontainers.utility.MountableFile;
  * is shared by every subclass in the JVM.
  */
 @SpringBootTest
+@Import(FakeLlmConfig.class)
 public abstract class PostgresIntegrationTest {
 
     protected static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.6")

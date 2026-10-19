@@ -17,3 +17,11 @@ app:
       url: jdbc:postgresql://localhost:5432/textsql
       username: ${ANALYST_DB_USER:analyst_ro}
       password: ${ANALYST_DB_PASSWORD:analyst_ro_dev}
+
+llm:
+  base-url: ${LLM_BASE_URL:https://generativelanguage.googleapis.com/v1beta/openai/}
+  api-key: ${LLM_API_KEY:}
+  model: ${LLM_MODEL:gemini-2.5-flash}
+  timeout: 30s
+  max-retries: 3
+  temperature: 0
