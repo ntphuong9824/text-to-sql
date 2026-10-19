@@ -6,21 +6,32 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 
 import net.sf.jsqlparser.JSQLParserException;
 import net.sf.jsqlparser.expression.AnalyticExpression;
 import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.expression.Function;
+import net.sf.jsqlparser.expression.JsonAggregateFunction;
+import net.sf.jsqlparser.expression.JsonExpression;
+import net.sf.jsqlparser.expression.JsonFunction;
+import net.sf.jsqlparser.expression.JsonFunctionExpression;
+import net.sf.jsqlparser.expression.JsonKeyValuePair;
 import net.sf.jsqlparser.expression.LongValue;
 import net.sf.jsqlparser.expression.WindowDefinition;
 import net.sf.jsqlparser.expression.WindowElement;
 import net.sf.jsqlparser.expression.WindowOffset;
+import net.sf.jsqlparser.expression.operators.relational.IsDistinctExpression;
+import net.sf.jsqlparser.expression.operators.relational.JsonOperator;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.Statements;
+import net.sf.jsqlparser.statement.select.FromItemVisitor;
+import net.sf.jsqlparser.statement.select.Join;
 import net.sf.jsqlparser.statement.select.Limit;
+import net.sf.jsqlparser.statement.select.ParenthesedFromItem;
 import net.sf.jsqlparser.statement.select.ParenthesedSelect;
 import net.sf.jsqlparser.statement.select.OrderByElement;
 import net.sf.jsqlparser.statement.select.PlainSelect;
@@ -51,7 +62,11 @@ public class SqlGuard {
             "txid_current", "version", "current_user", "session_user",
             "inet_server_addr", "inet_server_port",
             "has_table_privilege", "has_schema_privilege", "has_database_privilege",
-            "to_regclass", "xmlparse");
+            "to_regclass", "xmlparse", "ts_stat", "ts_rewrite");
+
+    /** Keyword forms that the parser reads as plain columns but that expose session information. */
+    private static final Set<String> KEYWORD_COLUMNS = Set.of(
+            "current_user", "session_user", "user", "current_role", "current_schema", "current_catalog");
 
     private static final List<String> BLOCKED_PREFIXES = List.of(
             "pg_", "lo_", "dblink",
@@ -105,15 +120,89 @@ public class SqlGuard {
         }
 
         applyLimit(select);
-        return GuardResult.allowed(select.toString());
+        String safeSql = select.toString();
+        Optional<String> backstop = lexicalBackstop(safeSql);
+        if (backstop.isPresent()) {
+            return GuardResult.blocked(backstop.get());
+        }
+        return GuardResult.allowed(safeSql);
     }
 
     /** @param name unquoted, lowercased, schema-stripped function name */
-    static boolean isBlockedFunction(String name) {
+    public static boolean isBlockedFunction(String name) {
         if (BLOCKED_FUNCTIONS.contains(name) || name.contains("_to_xml")) {
             return true;
         }
         return BLOCKED_PREFIXES.stream().anyMatch(name::startsWith);
+    }
+
+    /**
+     * Fail-closed lexical layer over the deparsed SQL, independent of the AST walk: string literals are
+     * skipped; identifiers (quoted or not) are checked for blocked function calls, pg_* / information_schema
+     * names and session keyword columns.
+     */
+    static Optional<String> lexicalBackstop(String sql) {
+        int n = sql.length();
+        int i = 0;
+        char prev = ' ';
+        while (i < n) {
+            char c = sql.charAt(i);
+            if (c == '\'') {
+                i++;
+                while (i < n) {
+                    if (sql.charAt(i) == '\'') {
+                        if (i + 1 < n && sql.charAt(i + 1) == '\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i++;
+                }
+                i++;
+                prev = '\'';
+                continue;
+            }
+            boolean quoted = c == '"';
+            if (quoted || Character.isLetter(c) || c == '_') {
+                int start = quoted ? i + 1 : i;
+                int j = start;
+                if (quoted) {
+                    while (j < n && sql.charAt(j) != '"') {
+                        j++;
+                    }
+                } else {
+                    while (j < n && (Character.isLetterOrDigit(sql.charAt(j)) || sql.charAt(j) == '_'
+                            || sql.charAt(j) == '$')) {
+                        j++;
+                    }
+                }
+                String name = sql.substring(start, j).toLowerCase(Locale.ROOT);
+                i = quoted ? j + 1 : j;
+                int k = i;
+                while (k < n && Character.isWhitespace(sql.charAt(k))) {
+                    k++;
+                }
+                boolean call = k < n && sql.charAt(k) == '(';
+                boolean qualified = prev == '.' || k < n && sql.charAt(k) == '.';
+                if (call && isBlockedFunction(name)) {
+                    return Optional.of("Hàm '" + name + "' bị cấm vì lý do an toàn.");
+                }
+                if (name.startsWith("pg_") || name.equals("information_schema")) {
+                    return Optional.of("Tên '" + name + "' thuộc catalog hệ thống, không được phép truy vấn.");
+                }
+                if (!quoted && !qualified && KEYWORD_COLUMNS.contains(name)) {
+                    return Optional.of("Từ khóa '" + name + "' tiết lộ thông tin phiên làm việc, không được phép.");
+                }
+                prev = 'a';
+                continue;
+            }
+            if (!Character.isWhitespace(c)) {
+                prev = c;
+            }
+            i++;
+        }
+        return Optional.empty();
     }
 
     private static boolean isAllowedTable(Table table) {
@@ -121,16 +210,25 @@ public class SqlGuard {
         if (table.getDatabase() != null && table.getDatabase().getDatabaseName() != null) {
             return false;
         }
-        String schema = unquote(table.getSchemaName());
-        return schema != null && ALLOWED_SCHEMA.equalsIgnoreCase(schema);
+        return table.getSchemaName() != null && ALLOWED_SCHEMA.equals(fold(table.getSchemaName()));
     }
 
     private static void applyLimit(Select select) {
-        Limit limit = select.getLimit();
+        // JSqlParser attaches a trailing "UNION ... LIMIT n" to the last (unparenthesized) branch; in
+        // Postgres that LIMIT applies to the whole set operation, so treat it as the outermost one.
+        Select holder = select;
+        if (select instanceof SetOperationList union && union.getLimit() == null
+                && union.getSelects() != null && !union.getSelects().isEmpty()) {
+            Select last = union.getSelects().get(union.getSelects().size() - 1);
+            if (last instanceof PlainSelect && last.getLimit() != null) {
+                holder = last;
+            }
+        }
+        Limit limit = holder.getLimit();
         if (limit == null) {
             limit = new Limit();
             limit.setRowCount(new LongValue(MAX_ROWS));
-            select.setLimit(limit);
+            holder.setLimit(limit);
             return;
         }
         if (limit.getRowCount() instanceof LongValue rows && rows.getValue() <= MAX_ROWS) {
@@ -140,6 +238,15 @@ public class SqlGuard {
         limit.setLimitAll(false);
         limit.setLimitNull(false);
         limit.setRowCount(new LongValue(MAX_ROWS));
+    }
+
+    /** Postgres folding: unquoted identifiers lowercase, quoted ones compare exactly. */
+    static String fold(String identifier) {
+        String n = identifier.strip();
+        if (n.length() >= 2 && n.startsWith("\"") && n.endsWith("\"")) {
+            return n.substring(1, n.length() - 1).replace("\"\"", "\"");
+        }
+        return n.toLowerCase(Locale.ROOT);
     }
 
     private static String unquote(String name) {
@@ -164,7 +271,23 @@ public class SqlGuard {
         String nonSelectCte;
         boolean hasInto;
         boolean hasLocking;
-        private final Deque<Set<String>> scopes = new ArrayDeque<>();
+        private final Deque<Scope> scopes = new ArrayDeque<>();
+
+        private static final class Scope {
+            final Set<String> names = new HashSet<>();
+            final boolean recursive;
+
+            Scope(boolean recursive) {
+                this.recursive = recursive;
+            }
+        }
+
+        /** WITH RECURSIVE written once applies to every item of that WITH clause. */
+        private void pushScope(Select select) {
+            boolean recursive = select.getWithItemsList() != null
+                    && select.getWithItemsList().stream().anyMatch(WithItem::isRecursive);
+            scopes.push(new Scope(recursive));
+        }
 
         void walk(Select select) {
             StringBuilder sink = new StringBuilder();
@@ -178,8 +301,8 @@ public class SqlGuard {
             if (table.getSchemaName() != null || table.getName() == null) {
                 return false;
             }
-            String n = unquote(table.getName()).toLowerCase(Locale.ROOT);
-            return scopes.stream().anyMatch(frame -> frame.contains(n));
+            String n = fold(table.getName());
+            return scopes.stream().anyMatch(frame -> frame.names.contains(n));
         }
 
         private void record(String name) {
@@ -195,6 +318,12 @@ public class SqlGuard {
         }
 
         private ExpressionDeParser expressions;
+
+        private void walkExpression(Object node) {
+            if (node instanceof Expression e) {
+                e.accept(expressions, null);
+            }
+        }
 
         /** The deparser prints WINDOW clauses and frame bounds as text, so walk their expressions here. */
         private void walkWindowElement(WindowElement element) {
@@ -242,6 +371,61 @@ public class SqlGuard {
             }
 
             @Override
+            public <S> StringBuilder visit(IsDistinctExpression expr, S context) {
+                walkExpression(expr.getLeftExpression());
+                walkExpression(expr.getRightExpression());
+                return super.visit(expr, context);
+            }
+
+            @Override
+            public <S> StringBuilder visit(JsonOperator expr, S context) {
+                walkExpression(expr.getLeftExpression());
+                walkExpression(expr.getRightExpression());
+                return super.visit(expr, context);
+            }
+
+            @Override
+            public <S> StringBuilder visit(JsonExpression expr, S context) {
+                walkExpression(expr.getExpression());
+                if (expr.getIdentList() != null) {
+                    for (java.util.Map.Entry<Expression, String> ident : expr.getIdentList()) {
+                        walkExpression(ident.getKey());
+                    }
+                }
+                return super.visit(expr, context);
+            }
+
+            @Override
+            public <S> StringBuilder visit(JsonFunction expr, S context) {
+                if (expr.getKeyValuePairs() != null) {
+                    for (JsonKeyValuePair pair : expr.getKeyValuePairs()) {
+                        walkExpression(pair.getKey());
+                        walkExpression(pair.getValue());
+                    }
+                }
+                if (expr.getExpressions() != null) {
+                    for (JsonFunctionExpression e : expr.getExpressions()) {
+                        walkExpression(e.getExpression());
+                    }
+                }
+                return super.visit(expr, context);
+            }
+
+            @Override
+            public <S> StringBuilder visit(JsonAggregateFunction expr, S context) {
+                walkExpression(expr.getExpression());
+                walkExpression(expr.getKey());
+                walkExpression(expr.getValue());
+                walkExpression(expr.getFilterExpression());
+                if (expr.getExpressionOrderByElements() != null) {
+                    for (OrderByElement order : expr.getExpressionOrderByElements()) {
+                        walkExpression(order.getExpression());
+                    }
+                }
+                return super.visit(expr, context);
+            }
+
+            @Override
             public <S> StringBuilder visit(AnalyticExpression expr, S context) {
                 record(expr.getName());
                 walkWindowElement(expr.getWindowElement());
@@ -263,6 +447,22 @@ public class SqlGuard {
             }
 
             @Override
+            public <S> StringBuilder visit(ParenthesedFromItem item, S context) {
+                // The deparser prints the joins inside the parentheses as text; walk them here.
+                if (item.getJoins() != null) {
+                    for (Join join : item.getJoins()) {
+                        join.getRightItem().accept((FromItemVisitor<StringBuilder>) this, null);
+                        if (join.getOnExpressions() != null) {
+                            for (Expression on : join.getOnExpressions()) {
+                                on.accept(expressions, null);
+                            }
+                        }
+                    }
+                }
+                return super.visit(item, context);
+            }
+
+            @Override
             public <S> StringBuilder visit(TableFunction tableFunction, S context) {
                 if (tableFunction.getFunction() != null) {
                     record(tableFunction.getFunction().getName());
@@ -275,15 +475,14 @@ public class SqlGuard {
                 if (!(withItem.getParenthesedStatement() instanceof ParenthesedSelect)) {
                     nonSelectCte = withItem.getUnquotedAliasName();
                 }
-                String alias = withItem.getUnquotedAliasName() == null ? null
-                        : withItem.getUnquotedAliasName().toLowerCase(Locale.ROOT);
-                Set<String> frame = scopes.peek();
-                if (withItem.isRecursive() && alias != null && frame != null) {
-                    frame.add(alias);
+                String alias = withItem.getAliasName() == null ? null : fold(withItem.getAliasName());
+                Scope frame = scopes.peek();
+                if (frame != null && frame.recursive && alias != null) {
+                    frame.names.add(alias);
                 }
                 StringBuilder result = super.visit(withItem, context);
                 if (alias != null && frame != null) {
-                    frame.add(alias);
+                    frame.names.add(alias);
                 }
                 return result;
             }
@@ -297,7 +496,7 @@ public class SqlGuard {
                 if (plainSelect.getForMode() != null || plainSelect.getForUpdateTable() != null) {
                     hasLocking = true;
                 }
-                scopes.push(new HashSet<>());
+                pushScope(plainSelect);
                 try {
                     walkWindowDefinitions(plainSelect.getWindowDefinitions());
                     return super.visit(plainSelect, context);
@@ -311,7 +510,7 @@ public class SqlGuard {
                 if (list.getForMode() != null || list.getForUpdateTable() != null) {
                     hasLocking = true;
                 }
-                scopes.push(new HashSet<>());
+                pushScope(list);
                 try {
                     return super.visit(list, context);
                 } finally {
@@ -321,7 +520,7 @@ public class SqlGuard {
 
             @Override
             public <S> StringBuilder visit(ParenthesedSelect select, S context) {
-                scopes.push(new HashSet<>());
+                pushScope(select);
                 try {
                     return super.visit(select, context);
                 } finally {

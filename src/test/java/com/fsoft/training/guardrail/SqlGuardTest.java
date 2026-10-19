@@ -126,6 +126,102 @@ class SqlGuardTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+            // 1. quoted identifiers are case-sensitive in Postgres
+            "WITH \"PG_USER\" AS (SELECT 1) SELECT * FROM pg_user",
+            "WITH \"Users\" AS (SELECT 1) SELECT * FROM users",
+            "SELECT * FROM \"DW\".dim_date",
+            // 2. joins inside a parenthesized FROM item
+            "SELECT * FROM (dw.dim_date d JOIN pg_shadow s ON true)",
+            "SELECT * FROM (dw.dim_date b CROSS JOIN pg_user)",
+            "SELECT * FROM dw.dim_date a JOIN (dw.dim_date b JOIN dw.dim_date c "
+                    + "ON current_setting('x')='1') ON true",
+            "SELECT * FROM (dw.dim_date d JOIN dw.dim_date e ON pg_sleep(1) IS NULL)",
+            "SELECT * FROM (dw.dim_date d JOIN app.users u ON true)",
+            // 3. IS [NOT] DISTINCT FROM
+            "SELECT * FROM dw.dim_date x WHERE x.date_key IS DISTINCT FROM (SELECT 1 FROM app.users)",
+            "SELECT * FROM dw.dim_date x WHERE x.date_key IS NOT DISTINCT FROM (SELECT 1 FROM app.users)",
+            "SELECT * FROM dw.dim_date x WHERE (SELECT 1 FROM app.users) IS DISTINCT FROM x.date_key",
+            "SELECT * FROM dw.dim_date x WHERE x.date_key IS DISTINCT FROM pg_sleep(1)",
+            // 4. SQL/JSON constructors
+            "SELECT JSON_ARRAYAGG((SELECT username FROM app.users LIMIT 1)) FROM dw.dim_date",
+            "SELECT JSON_ARRAY((SELECT username FROM app.users LIMIT 1)) FROM dw.dim_date",
+            "SELECT JSON_OBJECT('k' : (SELECT username FROM app.users LIMIT 1)) FROM dw.dim_date",
+            "SELECT JSON_OBJECTAGG(date_key VALUE (SELECT username FROM app.users LIMIT 1)) FROM dw.dim_date",
+            "SELECT JSON_OBJECT('k' VALUE pg_sleep(1)) FROM dw.dim_date",
+            // 5. JSON operators
+            "SELECT d.j -> (SELECT username FROM app.users LIMIT 1) FROM dw.dim_date d",
+            "SELECT d.j ->> pg_sleep(1)::text FROM dw.dim_date d",
+            "SELECT (SELECT '{}'::jsonb FROM app.users LIMIT 1) ->> 'a' FROM dw.dim_date d",
+            "SELECT d.j #>> (SELECT '{a}' FROM app.users LIMIT 1) FROM dw.dim_date d",
+            // 6. keyword forms parsed as columns
+            "SELECT current_user",
+            "SELECT session_user",
+            "SELECT user",
+            "SELECT current_role",
+            "SELECT current_schema",
+            "SELECT current_catalog",
+            "SELECT date_key, current_user FROM dw.dim_date",
+            // 7. functions running SQL text
+            "SELECT * FROM ts_stat('SELECT 1')",
+            "SELECT ts_rewrite('a'::tsquery, 'SELECT 1')"
+    })
+    void blocksRound2Bypasses(String sql) {
+        GuardResult r = guard.check(sql);
+        assertThat(r.allowed()).as(sql).isFalse();
+        assertThat(r.reason()).isNotBlank();
+    }
+
+    @Test
+    void allowsRecursiveAppliedToEveryWithItem() {
+        GuardResult r = guard.check("WITH RECURSIVE r AS (SELECT 1 n), "
+                + "s AS (SELECT n+1 FROM s WHERE n<3 UNION ALL SELECT n FROM r) SELECT * FROM s");
+        assertThat(r.allowed()).as(r.reason()).isTrue();
+    }
+
+    @Test
+    void quotedCteMatchesQuotedReferenceExactly() {
+        GuardResult r = guard.check("WITH \"Mixed\" AS (SELECT 1 AS n FROM dw.dim_date) SELECT * FROM \"Mixed\"");
+        assertThat(r.allowed()).as(r.reason()).isTrue();
+    }
+
+    @Test
+    void unionTrailingLimitIsKeptOrCappedAndSingle() {
+        GuardResult small = guard.check("SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales LIMIT 10");
+        assertThat(small.allowed()).as(small.reason()).isTrue();
+        assertThat(small.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 10");
+
+        GuardResult big = guard.check(
+                "SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales LIMIT 99999 OFFSET 5");
+        assertThat(big.allowed()).as(big.reason()).isTrue();
+        assertThat(big.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 1000").contains("OFFSET 5");
+
+        GuardResult none = guard.check("SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales");
+        assertThat(none.safeSql()).containsOnlyOnce("LIMIT").endsWith("LIMIT 1000");
+    }
+
+    @Test
+    void lexicalBackstopCatchesWhatTheAstWalkCouldMiss() {
+        assertThat(SqlGuard.lexicalBackstop("SELECT pg_sleep (1)")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT \"query_to_xml\"('x')")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT * FROM pg_user")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT * FROM information_schema.tables")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT current_user")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT CURRENT_SCHEMA")).isPresent();
+        // literals and unrelated identifiers are fine
+        assertThat(SqlGuard.lexicalBackstop("SELECT 'pg_sleep(1) current_user' FROM dw.dim_date")).isEmpty();
+        assertThat(SqlGuard.lexicalBackstop("SELECT d.user_name, sum(x) FROM dw.dim_date d")).isEmpty();
+        assertThat(SqlGuard.lexicalBackstop("SELECT 'it''s pg_sleep(1)', px FROM dw.dim_date")).isEmpty();
+    }
+
+    @Test
+    void blockedFunctionPredicateIsPublicAndCoversFamilies() {
+        assertThat(SqlGuard.isBlockedFunction("pg_sleep")).isTrue();
+        assertThat(SqlGuard.isBlockedFunction("ts_stat")).isTrue();
+        assertThat(SqlGuard.isBlockedFunction("sum")).isFalse();
+    }
+
     @Test
     void reasonNamesOffendingTableAndFunction() {
         assertThat(guard.check("SELECT * FROM app.users").reason()).contains("app.users");
