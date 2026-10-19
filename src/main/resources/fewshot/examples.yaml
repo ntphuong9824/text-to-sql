@@ -64,15 +64,15 @@ examples:
       FROM dw.fact_sales f
       JOIN dw.dim_track t ON t.track_key = f.track_key
       GROUP BY t.artist_name
-      ORDER BY revenue DESC
+      ORDER BY revenue DESC, t.artist_name
       LIMIT 5
   - question: "Top 10 best selling tracks"
     sql: |
-      SELECT t.track_name AS track_name, SUM(f.quantity) AS units_sold, SUM(f.revenue) AS revenue
+      SELECT t.track_name AS track_name, t.artist_name AS artist_name, SUM(f.quantity) AS units_sold, SUM(f.revenue) AS revenue
       FROM dw.fact_sales f
       JOIN dw.dim_track t ON t.track_key = f.track_key
-      GROUP BY t.track_name
-      ORDER BY revenue DESC, units_sold DESC
+      GROUP BY t.track_key, t.track_name, t.artist_name
+      ORDER BY revenue DESC, units_sold DESC, t.track_name, t.track_key
       LIMIT 10
   - question: "Thể loại nhạc nào bán chạy nhất năm 2023?"
     sql: |
@@ -82,7 +82,7 @@ examples:
       JOIN dw.dim_date d ON d.date_key = f.date_key
       WHERE d.year = 2023
       GROUP BY t.genre_name
-      ORDER BY revenue DESC
+      ORDER BY revenue DESC, t.genre_name
       LIMIT 1
   - question: "Doanh thu theo thể loại"
     sql: |
@@ -112,8 +112,8 @@ examples:
       SELECT e.full_name AS employee_name, SUM(f.revenue) AS revenue
       FROM dw.fact_sales f
       JOIN dw.dim_employee e ON e.employee_key = f.employee_key
-      GROUP BY e.full_name
-      ORDER BY revenue DESC
+      GROUP BY e.employee_key, e.full_name
+      ORDER BY revenue DESC, e.full_name
       LIMIT 1
   - question: "Doanh thu của từng nhân viên trong năm 2022"
     sql: |
@@ -122,8 +122,8 @@ examples:
       JOIN dw.dim_employee e ON e.employee_key = f.employee_key
       JOIN dw.dim_date d ON d.date_key = f.date_key
       WHERE d.year = 2022
-      GROUP BY e.full_name
-      ORDER BY revenue DESC
+      GROUP BY e.employee_key, e.full_name
+      ORDER BY revenue DESC, e.full_name
   - question: "So sánh doanh thu năm 2023 và 2024"
     sql: |
       SELECT d.year AS year, SUM(f.revenue) AS revenue
@@ -141,13 +141,13 @@ examples:
       WHERE d.year IN (2021, 2025)
       GROUP BY c.region, d.year
       ORDER BY c.region, d.year
-  - question: "Khách hàng mua nhiều nhất"
+  - question: "Khách hàng chi tiêu nhiều nhất"
     sql: |
       SELECT c.full_name AS customer_name, SUM(f.revenue) AS revenue
       FROM dw.fact_sales f
       JOIN dw.dim_customer c ON c.customer_key = f.customer_key
       GROUP BY c.customer_key, c.full_name
-      ORDER BY revenue DESC
+      ORDER BY revenue DESC, c.full_name
       LIMIT 1
   - question: "Top 5 customers by total spending"
     sql: |
@@ -155,7 +155,7 @@ examples:
       FROM dw.fact_sales f
       JOIN dw.dim_customer c ON c.customer_key = f.customer_key
       GROUP BY c.customer_key, c.full_name, c.country
-      ORDER BY revenue DESC
+      ORDER BY revenue DESC, c.full_name
       LIMIT 5
   - question: "Thời lượng trung bình của bài hát theo thể loại"
     sql: |
@@ -177,7 +177,7 @@ examples:
       JOIN dw.dim_customer c ON c.customer_key = f.customer_key
       WHERE c.region = 'Asia-Pacific'
       GROUP BY c.city
-      ORDER BY revenue DESC
+      ORDER BY revenue DESC, c.city
       LIMIT 10
   - question: "Doanh thu Rock theo từng năm"
     sql: |
