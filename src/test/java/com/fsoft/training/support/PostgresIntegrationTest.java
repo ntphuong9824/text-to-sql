@@ -23,6 +23,8 @@ public abstract class PostgresIntegrationTest {
             .withPassword("postgres")
             .withCopyFileToContainer(MountableFile.forHostPath("db/init"), "/docker-entrypoint-initdb.d/");
 
+    public static final String TEST_JWT_SECRET = "test-only-jwt-secret-at-least-32-bytes-long!!";
+
     static {
         POSTGRES.start();
     }
@@ -31,6 +33,7 @@ public abstract class PostgresIntegrationTest {
     static void datasourceProperties(DynamicPropertyRegistry registry) {
         registry.add("app.datasource.app.url", POSTGRES::getJdbcUrl);
         registry.add("app.datasource.analyst.url", POSTGRES::getJdbcUrl);
+        registry.add("app.jwt.secret", () -> TEST_JWT_SECRET);
     }
 
     protected JdbcTemplate superuserJdbc() {
