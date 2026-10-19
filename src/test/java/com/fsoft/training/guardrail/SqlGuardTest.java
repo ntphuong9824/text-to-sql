@@ -54,6 +54,78 @@ class SqlGuardTest {
         assertThat(result.reason()).isNotBlank();
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+            // CTE scoping (Critical 1)
+            "WITH pg_user AS (SELECT * FROM pg_user) SELECT * FROM pg_user",
+            "WITH users AS (SELECT * FROM users) SELECT * FROM users",
+            "WITH a AS (SELECT * FROM b), b AS (SELECT 1 FROM dw.dim_date) SELECT * FROM a",
+            "SELECT * FROM (WITH pg_user AS (SELECT 1) SELECT * FROM pg_user) s CROSS JOIN pg_user",
+            "SELECT * FROM dw.dim_date WHERE date_key IN "
+                    + "(WITH pg_user AS (SELECT * FROM pg_user) SELECT usename FROM pg_user)",
+            // clauses skipped by the old traversal, table rule (Critical 2)
+            "SELECT * FROM dw.dim_date ORDER BY (SELECT password FROM app.users LIMIT 1)",
+            "SELECT * FROM dw.dim_date OFFSET (SELECT password::int FROM app.users LIMIT 1)",
+            "SELECT * FROM dw.dim_date LIMIT 10 OFFSET (SELECT count(*) FROM pg_shadow)",
+            "SELECT count(*) FROM dw.dim_date GROUP BY (SELECT 1 FROM app.users LIMIT 1)",
+            "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM app.users)) FROM dw.dim_date",
+            "SELECT rank() OVER (ORDER BY (SELECT 1 FROM pg_shadow)) FROM dw.dim_date",
+            "SELECT DISTINCT ON ((SELECT usename FROM pg_user LIMIT 1)) date_key FROM dw.dim_date",
+            "SELECT * FROM dw.dim_date FETCH FIRST (SELECT 1 FROM app.users) ROWS ONLY",
+            // clauses skipped by the old traversal, function rule (Critical 2)
+            "SELECT * FROM dw.dim_date ORDER BY pg_sleep(5)",
+            "SELECT * FROM dw.dim_date ORDER BY current_setting('x')",
+            "SELECT * FROM dw.dim_date OFFSET pg_sleep(5)::text::int",
+            "SELECT count(*) FILTER (WHERE pg_sleep(1) IS NULL) FROM dw.dim_date",
+            "SELECT rank() OVER (PARTITION BY pg_sleep(1)) FROM dw.dim_date",
+            "SELECT rank() OVER w FROM dw.dim_date WINDOW w AS (ORDER BY pg_sleep(1))",
+            "SELECT string_agg(name, ',' ORDER BY pg_sleep(1)) FROM dw.dim_track",
+            "SELECT * FROM (SELECT * FROM dw.dim_date ORDER BY pg_sleep(1)) s",
+            "SELECT * FROM dw.dim_date GROUP BY date_key HAVING pg_sleep(1) IS NULL",
+            // function rule families (Important 3)
+            "SELECT query_to_xml('select * from app.users', true, true, '')",
+            "SELECT table_to_xml('app.users', true, true, '')",
+            "SELECT cursor_to_xml('c', 1, true, true, '')",
+            "SELECT schema_to_xml('app', true, true, '')",
+            "SELECT database_to_xml(true, true, '')",
+            "SELECT query_to_xml_and_xmlschema('select 1', true, true, '')",
+            "SELECT lo_get(1)",
+            "SELECT pg_advisory_lock(1)",
+            "SELECT pg_stat_file('x')",
+            "SELECT pg_reload_conf()",
+            "SELECT dblink_exec('x', 'y')",
+            "SELECT nextval('dw.seq')",
+            "SELECT setval('dw.seq', 1)",
+            "SELECT version()",
+            "SELECT has_table_privilege('app.users', 'select')",
+            "SELECT to_regclass('app.users')"
+    })
+    void blocksBypassAttempts(String sql) {
+        GuardResult r = guard.check(sql);
+        assertThat(r.allowed()).as(sql).isFalse();
+        assertThat(r.reason()).isNotBlank();
+    }
+
+    @Test
+    void allowsAnalyticsFunctionsAndScopedCtes() {
+        String[] queries = {
+                "SELECT sum(total), count(*), avg(total), round(avg(total), 2), coalesce(max(total), 0) "
+                        + "FROM dw.fact_sales",
+                "SELECT to_char(d.full_date, 'YYYY-MM'), lower(d.month_name), upper(d.month_name), "
+                        + "concat(d.month_name, '-', d.year_num), CAST(d.year_num AS text), "
+                        + "row_number() OVER (ORDER BY d.full_date), rank() OVER (ORDER BY d.full_date) "
+                        + "FROM dw.dim_date d",
+                "SELECT string_agg(name, ',' ORDER BY name) FROM dw.dim_track",
+                "WITH a AS (SELECT 1 AS x FROM dw.dim_date), b AS (SELECT * FROM a) SELECT * FROM b",
+                "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT * FROM r",
+                "SELECT * FROM dw.dim_date ORDER BY (SELECT max(date_key) FROM dw.fact_sales)"
+        };
+        for (String q : queries) {
+            GuardResult r = guard.check(q);
+            assertThat(r.allowed()).as("%s -> %s", q, r.reason()).isTrue();
+        }
+    }
+
     @Test
     void reasonNamesOffendingTableAndFunction() {
         assertThat(guard.check("SELECT * FROM app.users").reason()).contains("app.users");
