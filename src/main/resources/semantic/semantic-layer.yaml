@@ -33,7 +33,7 @@ tables:
       - name: region
         type: text
         description: "Sales region derived from country (4 values)"
-        synonyms: [khu vực, vùng, Bắc Mỹ = North America, Châu Âu = Europe, Nam Mỹ = South America, Châu Á - Thái Bình Dương = Asia-Pacific]
+        synonyms: [khu vực, vùng, region]
         sampleValues: [North America, South America, Asia-Pacific, Europe]
   - name: dim_employee
     description: Employee dimension (sales support reps and managers).
@@ -80,4 +80,5 @@ rules:
   - description: Dùng alias f cho dw.fact_sales; join các bảng dim qua cột *_key.
   - description: Câu hỏi không nêu năm thì gộp mọi năm (không lọc năm).
   - description: Tháng/quý/năm lấy từ dw.dim_date qua fact_sales.date_key.
-  - description: Khu vực lấy từ dw.dim_customer.region; giá trị chính xác là North America, South America, Asia-Pacific, Europe.
+  - description: Khu vực lấy từ dw.dim_customer.region.
+  - description: "Giá trị region: Bắc Mỹ → 'North America'; Nam Mỹ → 'South America'; Châu Âu → 'Europe'; Châu Á - Thái Bình Dương → 'Asia-Pacific'. Luôn dùng giá trị tiếng Anh trong SQL."

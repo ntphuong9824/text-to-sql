@@ -22,4 +22,23 @@ class SchemaPromptRendererTest {
     void containsRules() {
         assertThat(out).contains("Câu hỏi không nêu năm thì gộp mọi năm", "Chỉ dùng schema dw");
     }
+
+    @Test
+    void tableLineHasColumnShape() {
+        assertThat(out).containsPattern("dw\\.fact_sales\\(sales_key int -- [^,]+");
+        assertThat(out).containsPattern("revenue numeric -- unit_price \\* quantity; đồng nghĩa: doanh thu");
+    }
+
+    @Test
+    void sectionsAreOrdered() {
+        assertThat(out).contains("\nMetrics:\n", "\nRules:\n");
+        assertThat(out.indexOf("Metrics:")).isLessThan(out.indexOf("Rules:"));
+    }
+
+    @Test
+    void regionMappingIsExplicitAndNotInSynonyms() {
+        assertThat(out.lines().filter(l -> l.contains("Bắc Mỹ")))
+                .anyMatch(l -> l.contains("'North America'"));
+        assertThat(out).doesNotContain("Bắc Mỹ = North America");
+    }
 }
