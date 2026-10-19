@@ -1,0 +1,83 @@
+tables:
+  - name: fact_sales
+    description: Sales fact, one row per invoice line. Join dims via the *_key columns.
+    columns:
+      - {name: sales_key, type: int, description: Invoice line id (PK)}
+      - {name: invoice_id, type: int, description: Invoice id (degenerate dimension; one invoice has many lines), synonyms: [hóa đơn, đơn hàng]}
+      - {name: date_key, type: int, description: "Invoice date, FK to dim_date.date_key"}
+      - {name: customer_key, type: int, description: "Buying customer, FK to dim_customer.customer_key"}
+      - {name: employee_key, type: int, description: "Support rep of the customer, FK to dim_employee.employee_key (may be null)"}
+      - {name: track_key, type: int, description: "Track sold, FK to dim_track.track_key"}
+      - {name: quantity, type: int, description: Units sold on this line, synonyms: [số lượng]}
+      - {name: unit_price, type: numeric, description: Price per unit at sale time, synonyms: [đơn giá]}
+      - {name: revenue, type: numeric, description: unit_price * quantity, synonyms: [doanh thu, doanh số, sales]}
+  - name: dim_date
+    description: Calendar dimension, one row per day from first to last invoice date.
+    columns:
+      - {name: date_key, type: int, description: "Date as integer yyyymmdd (PK)"}
+      - {name: full_date, type: date, description: Calendar date, synonyms: [ngày]}
+      - {name: day, type: int, description: Day of month (1-31)}
+      - {name: month, type: int, description: Month number (1-12), synonyms: [tháng]}
+      - {name: month_name, type: text, description: English month name, synonyms: [tên tháng], sampleValues: [January, September, December]}
+      - {name: quarter, type: int, description: Quarter of the year (1-4), synonyms: [quý]}
+      - {name: year, type: int, description: Calendar year, synonyms: [năm], sampleValues: ["2021", "2022", "2023", "2024", "2025"]}
+  - name: dim_customer
+    description: Customer dimension, one row per customer.
+    columns:
+      - {name: customer_key, type: int, description: Customer id (PK)}
+      - {name: full_name, type: text, description: Customer first and last name, synonyms: [tên khách hàng, khách hàng]}
+      - {name: company, type: text, description: Company name (may be null), synonyms: [công ty]}
+      - {name: city, type: text, description: Customer city, synonyms: [thành phố]}
+      - {name: state, type: text, description: Customer state or province (may be null), synonyms: [bang, tỉnh]}
+      - {name: country, type: text, description: Customer country, synonyms: [quốc gia, nước], sampleValues: [USA, Canada, Brazil, France, Germany, United Kingdom, India, Australia]}
+      - name: region
+        type: text
+        description: "Sales region derived from country (4 values)"
+        synonyms: [khu vực, vùng, Bắc Mỹ = North America, Châu Âu = Europe, Nam Mỹ = South America, Châu Á - Thái Bình Dương = Asia-Pacific]
+        sampleValues: [North America, South America, Asia-Pacific, Europe]
+  - name: dim_employee
+    description: Employee dimension (sales support reps and managers).
+    columns:
+      - {name: employee_key, type: int, description: Employee id (PK)}
+      - {name: full_name, type: text, description: Employee first and last name, synonyms: [nhân viên, tên nhân viên]}
+      - {name: title, type: text, description: Job title, synonyms: [chức danh], sampleValues: [General Manager, Sales Manager, Sales Support Agent, IT Manager, IT Staff]}
+      - {name: city, type: text, description: Employee city}
+      - {name: country, type: text, description: Employee country, sampleValues: [Canada]}
+  - name: dim_track
+    description: Track dimension with album, artist, genre and media type flattened in.
+    columns:
+      - {name: track_key, type: int, description: Track id (PK)}
+      - {name: track_name, type: text, description: Track title, synonyms: [bài hát, tên bài hát]}
+      - {name: album_title, type: text, description: Album title, synonyms: [album]}
+      - {name: artist_name, type: text, description: Artist name, synonyms: [nghệ sĩ, ca sĩ]}
+      - {name: genre_name, type: text, description: Genre name (may be null), synonyms: [thể loại], sampleValues: [Rock, Latin, Metal, Alternative & Punk, Jazz, Blues, Pop, Hip Hop/Rap, Classical]}
+      - {name: media_type_name, type: text, description: Media type name, synonyms: [định dạng], sampleValues: [MPEG audio file, Protected AAC audio file, AAC audio file]}
+      - {name: composer, type: text, description: Composer (may be null), synonyms: [nhà soạn nhạc]}
+      - {name: milliseconds, type: int, description: Track length in milliseconds, synonyms: [độ dài]}
+      - {name: unit_price, type: numeric, description: List price of the track}
+  - name: country_region
+    description: Mapping from customer country to sales region.
+    columns:
+      - {name: country, type: text, description: Country name (PK)}
+      - {name: region, type: text, description: "Sales region: North America, South America, Asia-Pacific or Europe", sampleValues: [North America, South America, Asia-Pacific, Europe]}
+
+metrics:
+  - name: revenue
+    description: Total sales revenue
+    sqlExpression: SUM(f.revenue)
+    synonyms: [doanh thu, doanh số, sales]
+  - name: order_count
+    description: Number of orders (invoices)
+    sqlExpression: COUNT(DISTINCT f.invoice_id)
+    synonyms: [số đơn, số hóa đơn]
+  - name: customer_count
+    description: Number of distinct buying customers
+    sqlExpression: COUNT(DISTINCT f.customer_key)
+    synonyms: [số khách hàng, số lượng khách hàng]
+
+rules:
+  - description: Chỉ dùng schema dw; luôn ghi tiền tố dw. trước tên bảng.
+  - description: Dùng alias f cho dw.fact_sales; join các bảng dim qua cột *_key.
+  - description: Câu hỏi không nêu năm thì gộp mọi năm (không lọc năm).
+  - description: Tháng/quý/năm lấy từ dw.dim_date qua fact_sales.date_key.
+  - description: Khu vực lấy từ dw.dim_customer.region; giá trị chính xác là North America, South America, Asia-Pacific, Europe.
