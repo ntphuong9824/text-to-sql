@@ -21,6 +21,11 @@ public class PlanInspector {
     private static final String ALLOWED_SCHEMA = "dw";
     private static final Pattern CALL = Pattern.compile("([A-Za-z_][A-Za-z0-9_$]*)\\s*\\(");
 
+    /** Session keywords that Postgres prints without parentheses. */
+    private static final Pattern KEYWORD = Pattern.compile(
+            "(?i)(?<![A-Za-z0-9_$])(current_user|session_user|current_role|current_schema|current_catalog"
+                    + "|system_user|user)(?![A-Za-z0-9_$])");
+
     private final JdbcTemplate jdbc;
     private final JsonMapper mapper = JsonMapper.builder().build();
 
@@ -80,7 +85,12 @@ public class PlanInspector {
     }
 
     private static String scanText(String text) {
-        Matcher m = CALL.matcher(stripLiterals(text));
+        String code = stripLiterals(text);
+        Matcher kw = KEYWORD.matcher(code);
+        if (kw.find()) {
+            return blocked(kw.group(1).toLowerCase(Locale.ROOT));
+        }
+        Matcher m = CALL.matcher(code);
         while (m.find()) {
             String name = m.group(1).toLowerCase(Locale.ROOT);
             if (SqlGuard.isBlockedFunction(name)) {
@@ -90,20 +100,27 @@ public class PlanInspector {
         return null;
     }
 
-    /** Removes single-quoted literals ('' is an escaped quote) so strings never look like calls. */
+    /**
+     * Blanks out single-quoted literals ('' escape) and double-quoted identifiers ("" escape) so that
+     * neither can look like a call, and so a quote inside one kind never confuses the other.
+     */
     private static String stripLiterals(String text) {
         StringBuilder sb = new StringBuilder(text.length());
-        boolean in = false;
+        char quote = 0;
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
-            if (c == '\'') {
-                if (in && i + 1 < text.length() && text.charAt(i + 1) == '\'') {
-                    i++;
-                } else {
-                    in = !in;
-                    sb.append(' ');
+            if (quote != 0) {
+                if (c == quote) {
+                    if (i + 1 < text.length() && text.charAt(i + 1) == quote) {
+                        i++;
+                    } else {
+                        quote = 0;
+                    }
                 }
-            } else if (!in) {
+            } else if (c == '\'' || c == '"') {
+                quote = c;
+                sb.append(' ');
+            } else {
                 sb.append(c);
             }
         }

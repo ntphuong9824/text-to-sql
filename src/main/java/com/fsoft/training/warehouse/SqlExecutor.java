@@ -69,7 +69,7 @@ public class SqlExecutor {
             }
             List<Object> row = new ArrayList<>(n);
             for (int i = 1; i <= n; i++) {
-                row.add(value(rs, i, md.getColumnType(i)));
+                row.add(value(rs, i, md.getColumnType(i), md.getColumnTypeName(i)));
             }
             rows.add(row);
         }
@@ -86,11 +86,13 @@ public class SqlExecutor {
         };
     }
 
-    private static Object value(ResultSet rs, int i, int sqlType) throws SQLException {
+    private static Object value(ResultSet rs, int i, int sqlType, String typeName) throws SQLException {
         Object raw = switch (sqlType) {
             case Types.DATE -> rs.getObject(i, LocalDate.class);
-            case Types.TIMESTAMP -> rs.getObject(i, LocalDateTime.class);
-            case Types.TIMESTAMP_WITH_TIMEZONE -> rs.getObject(i, OffsetDateTime.class);
+            // pgjdbc reports timestamptz as Types.TIMESTAMP, so the type name decides.
+            case Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE -> "timestamptz".equalsIgnoreCase(typeName)
+                    ? rs.getObject(i, OffsetDateTime.class)
+                    : rs.getObject(i, LocalDateTime.class);
             default -> rs.getObject(i);
         };
         if (raw == null) {

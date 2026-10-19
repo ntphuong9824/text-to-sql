@@ -54,4 +54,18 @@ class PlanInspectorTest extends PostgresIntegrationTest {
         assertThat(inspector.violation("SELECT * FROM chinook.album")).isEmpty();
         assertThat(inspector.violation("SELECT nope FROM dw.dim_date")).isEmpty();
     }
+
+    @Test
+    void quoteInsideQuotedIdentifierDoesNotHideCall() {
+        assertThat(inspector.violation("SELECT 1 FROM dw.dim_date \"a'b\" WHERE \"a'b\".month_name = 'x' "
+                + "OR pg_sleep(0) IS NULL LIMIT 1")).isPresent();
+    }
+
+    @Test
+    void keywordSessionFunctionsAreCaught() {
+        for (String kw : new String[] {"current_user", "session_user", "current_role", "current_schema",
+                "current_catalog", "user"}) {
+            assertThat(inspector.violation("SELECT " + kw)).as(kw).isPresent();
+        }
+    }
 }

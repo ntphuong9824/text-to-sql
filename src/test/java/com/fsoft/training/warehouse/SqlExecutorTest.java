@@ -75,4 +75,19 @@ class SqlExecutorTest extends PostgresIntegrationTest {
         String json = JsonMapper.builder().build().writeValueAsString(executor.execute(BY_REGION));
         assertThat(json).contains("\"columns\"").contains("\"truncated\":false");
     }
+
+    @Test
+    void timestamptzColumnIsDateWithIsoString() {
+        QueryResult r = executor.execute("select date_trunc('month', full_date) m from dw.dim_date limit 1");
+        assertThat(r.columns().get(0).type()).isEqualTo("date");
+        assertThat((String) r.rows().get(0).get(0)).startsWith("20").contains("T");
+    }
+
+    @Test
+    void plainTimestampAndNowWork() {
+        QueryResult r = executor.execute("select full_date::timestamp as a, now() as b from dw.dim_date limit 1");
+        assertThat(r.columns()).extracting(ColumnInfo::type).containsExactly("date", "date");
+        assertThat(r.rows().get(0).get(0)).isInstanceOf(String.class);
+        assertThat(r.rows().get(0).get(1)).isInstanceOf(String.class);
+    }
 }
