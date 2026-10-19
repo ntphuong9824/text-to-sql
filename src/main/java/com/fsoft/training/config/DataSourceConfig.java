@@ -30,6 +30,12 @@ public class DataSourceConfig {
     }
 
     @Bean
+    @Primary
+    public JdbcTemplate appJdbcTemplate(DataSource appDataSource) {
+        return new JdbcTemplate(appDataSource);
+    }
+
+    @Bean
     @ConfigurationProperties("app.datasource.analyst")
     public DataSourceProperties analystDataSourceProperties() {
         return new DataSourceProperties();
