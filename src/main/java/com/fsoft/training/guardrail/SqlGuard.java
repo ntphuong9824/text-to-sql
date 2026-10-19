@@ -25,6 +25,7 @@ import net.sf.jsqlparser.expression.WindowOffset;
 import net.sf.jsqlparser.expression.operators.relational.IsDistinctExpression;
 import net.sf.jsqlparser.expression.operators.relational.JsonOperator;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.Statements;
@@ -38,7 +39,9 @@ import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
 import net.sf.jsqlparser.statement.select.SelectVisitor;
 import net.sf.jsqlparser.statement.select.SetOperationList;
+import net.sf.jsqlparser.statement.select.Fetch;
 import net.sf.jsqlparser.statement.select.TableFunction;
+import net.sf.jsqlparser.statement.select.TableStatement;
 import net.sf.jsqlparser.statement.select.WithItem;
 import net.sf.jsqlparser.util.deparser.ExpressionDeParser;
 import net.sf.jsqlparser.util.deparser.SelectDeParser;
@@ -62,11 +65,14 @@ public class SqlGuard {
             "txid_current", "version", "current_user", "session_user",
             "inet_server_addr", "inet_server_port",
             "has_table_privilege", "has_schema_privilege", "has_database_privilege",
-            "to_regclass", "xmlparse", "ts_stat", "ts_rewrite");
+            "to_regclass", "xmlparse", "ts_stat", "ts_rewrite",
+            "getpgusername", "current_database", "current_schemas", "inet_client_addr",
+            "inet_client_port", "current_query");
 
     /** Keyword forms that the parser reads as plain columns but that expose session information. */
     private static final Set<String> KEYWORD_COLUMNS = Set.of(
-            "current_user", "session_user", "user", "current_role", "current_schema", "current_catalog");
+            "current_user", "session_user", "system_user", "user", "current_role", "current_schema",
+            "current_catalog");
 
     private static final List<String> BLOCKED_PREFIXES = List.of(
             "pg_", "lo_", "dblink",
@@ -97,6 +103,13 @@ public class SqlGuard {
         } catch (RuntimeException e) {
             return GuardResult.blocked("SQL không hợp lệ: không kiểm tra được cấu trúc câu lệnh.");
         }
+        if (inspector.tableStatement) {
+            return GuardResult.blocked("Câu lệnh TABLE không được hỗ trợ, hãy dùng SELECT ... FROM dw.<tên bảng>.");
+        }
+        if (inspector.keywordColumn != null) {
+            return GuardResult.blocked("Từ khóa '" + inspector.keywordColumn
+                    + "' tiết lộ thông tin phiên làm việc, không được phép.");
+        }
         if (inspector.nonSelectCte != null) {
             return GuardResult.blocked("CTE '" + inspector.nonSelectCte
                     + "' không phải câu lệnh SELECT, chỉ cho phép SELECT.");
@@ -121,7 +134,10 @@ public class SqlGuard {
 
         applyLimit(select);
         String safeSql = select.toString();
-        Optional<String> backstop = lexicalBackstop(safeSql);
+        Optional<String> backstop = lexicalBackstop(sql);
+        if (backstop.isEmpty()) {
+            backstop = lexicalBackstop(safeSql);
+        }
         if (backstop.isPresent()) {
             return GuardResult.blocked(backstop.get());
         }
@@ -136,10 +152,14 @@ public class SqlGuard {
         return BLOCKED_PREFIXES.stream().anyMatch(name::startsWith);
     }
 
+    private static final String DOLLAR_REASON = "Không hỗ trợ chuỗi dollar-quoted ($$), hãy dùng dấu nháy đơn '...'.";
+
     /**
-     * Fail-closed lexical layer over the deparsed SQL, independent of the AST walk: string literals are
-     * skipped; identifiers (quoted or not) are checked for blocked function calls, pg_* / information_schema
-     * names and session keyword columns.
+     * Fail-closed lexical layer over SQL text, independent of the AST walk. String literals (standard
+     * with '' escape, and E'...' with backslash escapes), comments and quoted identifiers are lexed
+     * properly; anything it cannot lex with certainty (unterminated string/comment/identifier, any
+     * '$' outside a string literal) is blocked. Outside literals it blocks blocked-function calls,
+     * pg_* / information_schema names and session keyword columns.
      */
     static Optional<String> lexicalBackstop(String sql) {
         int n = sql.length();
@@ -148,19 +168,28 @@ public class SqlGuard {
         while (i < n) {
             char c = sql.charAt(i);
             if (c == '\'') {
-                i++;
-                while (i < n) {
-                    if (sql.charAt(i) == '\'') {
-                        if (i + 1 < n && sql.charAt(i + 1) == '\'') {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
+                i = skipString(sql, i, false);
+                if (i < 0) {
+                    return Optional.of(UNTERMINATED_REASON);
+                }
+                prev = '\'';
+                continue;
+            }
+            if (c == '$') {
+                return Optional.of(DOLLAR_REASON);
+            }
+            if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
+                while (i < n && sql.charAt(i) != '\n') {
                     i++;
                 }
-                i++;
-                prev = '\'';
+                continue;
+            }
+            if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
+                int end = sql.indexOf("*/", i + 2);
+                if (end < 0) {
+                    return Optional.of(UNTERMINATED_REASON);
+                }
+                i = end + 2;
                 continue;
             }
             boolean quoted = c == '"';
@@ -168,17 +197,28 @@ public class SqlGuard {
                 int start = quoted ? i + 1 : i;
                 int j = start;
                 if (quoted) {
-                    while (j < n && sql.charAt(j) != '"') {
-                        j++;
+                    while (j < n && !(sql.charAt(j) == '"'
+                            && !(j + 1 < n && sql.charAt(j + 1) == '"'))) {
+                        j += sql.charAt(j) == '"' ? 2 : 1;
+                    }
+                    if (j >= n) {
+                        return Optional.of(UNTERMINATED_REASON);
                     }
                 } else {
-                    while (j < n && (Character.isLetterOrDigit(sql.charAt(j)) || sql.charAt(j) == '_'
-                            || sql.charAt(j) == '$')) {
+                    while (j < n && (Character.isLetterOrDigit(sql.charAt(j)) || sql.charAt(j) == '_')) {
                         j++;
                     }
                 }
                 String name = sql.substring(start, j).toLowerCase(Locale.ROOT);
                 i = quoted ? j + 1 : j;
+                if (!quoted && name.equals("e") && i < n && sql.charAt(i) == '\'') {
+                    i = skipString(sql, i, true);
+                    if (i < 0) {
+                        return Optional.of(UNTERMINATED_REASON);
+                    }
+                    prev = '\'';
+                    continue;
+                }
                 int k = i;
                 while (k < n && Character.isWhitespace(sql.charAt(k))) {
                     k++;
@@ -197,12 +237,43 @@ public class SqlGuard {
                 prev = 'a';
                 continue;
             }
+            if (Character.isDigit(c)) {
+                while (i < n && (Character.isLetterOrDigit(sql.charAt(i)) || sql.charAt(i) == '_')) {
+                    i++;
+                }
+                prev = '0';
+                continue;
+            }
             if (!Character.isWhitespace(c)) {
                 prev = c;
             }
             i++;
         }
         return Optional.empty();
+    }
+
+    private static final String UNTERMINATED_REASON = "SQL không hợp lệ: chuỗi hoặc chú thích không được đóng.";
+
+    /** @return index just after the closing quote, or -1 if the literal is unterminated */
+    private static int skipString(String sql, int openQuote, boolean backslashEscapes) {
+        int n = sql.length();
+        int i = openQuote + 1;
+        while (i < n) {
+            char ch = sql.charAt(i);
+            if (backslashEscapes && ch == '\\') {
+                i += 2;
+                continue;
+            }
+            if (ch == '\'') {
+                if (i + 1 < n && sql.charAt(i + 1) == '\'') {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i++;
+        }
+        return -1;
     }
 
     private static boolean isAllowedTable(Table table) {
@@ -214,30 +285,46 @@ public class SqlGuard {
     }
 
     private static void applyLimit(Select select) {
-        // JSqlParser attaches a trailing "UNION ... LIMIT n" to the last (unparenthesized) branch; in
-        // Postgres that LIMIT applies to the whole set operation, so treat it as the outermost one.
+        // JSqlParser attaches a trailing "UNION ... LIMIT n" / FETCH to the last (unparenthesized)
+        // branch; in Postgres it applies to the whole set operation, so treat it as the outermost one.
         Select holder = select;
-        if (select instanceof SetOperationList union && union.getLimit() == null
+        if (select instanceof SetOperationList union && union.getLimit() == null && union.getFetch() == null
                 && union.getSelects() != null && !union.getSelects().isEmpty()) {
             Select last = union.getSelects().get(union.getSelects().size() - 1);
-            if (last instanceof PlainSelect && last.getLimit() != null) {
+            if (last instanceof PlainSelect && (last.getLimit() != null || last.getFetch() != null)) {
                 holder = last;
             }
         }
+        long cap = MAX_ROWS;
         Limit limit = holder.getLimit();
+        if (limit != null && limit.getRowCount() instanceof LongValue rows) {
+            cap = Math.min(cap, rows.getValue());
+        }
+        Fetch fetch = holder.getFetch();
+        if (fetch != null) {
+            cap = Math.min(cap, fetchRows(fetch));
+            holder.setFetch(null);
+        }
         if (limit == null) {
             limit = new Limit();
-            limit.setRowCount(new LongValue(MAX_ROWS));
             holder.setLimit(limit);
-            return;
         }
-        if (limit.getRowCount() instanceof LongValue rows && rows.getValue() <= MAX_ROWS) {
-            return;
-        }
-        // Too large, LIMIT ALL / NULL, or an expression we cannot prove is <= MAX_ROWS.
+        // Over the cap, LIMIT ALL / NULL, or an expression we cannot prove is <= MAX_ROWS: use the cap.
         limit.setLimitAll(false);
         limit.setLimitNull(false);
-        limit.setRowCount(new LongValue(MAX_ROWS));
+        limit.setRowCount(new LongValue(cap));
+    }
+
+    /** Row count of FETCH FIRST n ROWS ONLY; anything else (WITH TIES, expression) counts as MAX_ROWS. */
+    private static long fetchRows(Fetch fetch) {
+        if (fetch.toString().toUpperCase(Locale.ROOT).contains("TIES")) {
+            return MAX_ROWS;
+        }
+        if (fetch.getExpression() instanceof LongValue rows) {
+            return rows.getValue();
+        }
+        return fetch.getExpression() == null && fetch.getFetchJdbcParameter() == null
+                ? fetch.getRowCount() : MAX_ROWS;
     }
 
     /** Postgres folding: unquoted identifiers lowercase, quoted ones compare exactly. */
@@ -271,6 +358,8 @@ public class SqlGuard {
         String nonSelectCte;
         boolean hasInto;
         boolean hasLocking;
+        boolean tableStatement;
+        String keywordColumn;
         private final Deque<Scope> scopes = new ArrayDeque<>();
 
         private static final class Scope {
@@ -371,6 +460,16 @@ public class SqlGuard {
             }
 
             @Override
+            public <S> StringBuilder visit(Column column, S context) {
+                String name = column.getColumnName();
+                if (column.getTable() == null && name != null && !name.startsWith("\"")
+                        && KEYWORD_COLUMNS.contains(name.toLowerCase(Locale.ROOT))) {
+                    keywordColumn = name.toLowerCase(Locale.ROOT);
+                }
+                return super.visit(column, context);
+            }
+
+            @Override
             public <S> StringBuilder visit(IsDistinctExpression expr, S context) {
                 walkExpression(expr.getLeftExpression());
                 walkExpression(expr.getRightExpression());
@@ -443,6 +542,12 @@ public class SqlGuard {
                 if (!isVisibleCte(table)) {
                     tables.add(table);
                 }
+                return super.visit(table, context);
+            }
+
+            @Override
+            public <S> StringBuilder visit(TableStatement table, S context) {
+                tableStatement = true;
                 return super.visit(table, context);
             }
 

@@ -222,6 +222,93 @@ class SqlGuardTest {
         assertThat(SqlGuard.isBlockedFunction("sum")).isFalse();
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+            // 1/2. dollar-quote desync and keyword columns hidden behind it
+            "SELECT $$'$$, pg_sleep(1), $$'$$",
+            "SELECT $$'$$, session_user, $$'$$",
+            "SELECT $$'$$, user, current_role, current_schema, current_catalog, $$'$$",
+            "SELECT $$'$$ || current_user || $$'$$ AS who FROM dw.dim_date",
+            "SELECT * FROM dw.dim_date WHERE $$'$$ <> current_user OR $$'$$ = ''",
+            "SELECT $tag$x$tag$ FROM dw.dim_date",
+            "SELECT system_user",
+            // keyword columns enforced in the AST as well
+            "SELECT * FROM dw.dim_date WHERE 'x' <> current_user",
+            "SELECT session_user FROM dw.dim_date",
+            // 3. TABLE statement
+            "TABLE app.users",
+            "TABLE dw.dim_date",
+            // 4. session-info functions
+            "SELECT getpgusername()",
+            "SELECT current_database()",
+            "SELECT current_schemas(true)",
+            "SELECT inet_client_addr()",
+            "SELECT inet_client_port()",
+            "SELECT current_query()"
+    })
+    void blocksRound3Bypasses(String sql) {
+        GuardResult r = guard.check(sql);
+        assertThat(r.allowed()).as(sql).isFalse();
+        assertThat(r.reason()).isNotBlank();
+    }
+
+    @Test
+    void dollarQuotingGivesSpecificReason() {
+        assertThat(guard.check("SELECT $$x$$ FROM dw.dim_date").reason()).contains("dollar");
+    }
+
+    @Test
+    void lexerFailsClosedOnUnterminatedString() {
+        assertThat(SqlGuard.lexicalBackstop("SELECT 'abc")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT $$'$$, pg_sleep(1), $$'$$")).isPresent();
+    }
+
+    @Test
+    void lexerHandlesEscapeStrings() {
+        assertThat(SqlGuard.lexicalBackstop("SELECT E'it\\'s pg_sleep(1)'")).isEmpty();
+        assertThat(SqlGuard.lexicalBackstop("SELECT E'\\'', pg_sleep(1)")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT 'a''b', pg_sleep(1)")).isPresent();
+    }
+
+    @Test
+    void literalsWithSuspiciousTextStillPass() {
+        String[] queries = {
+                "SELECT 'pg_sleep(1)' AS a FROM dw.dim_date",
+                "SELECT 'DROP TABLE x', 'current_user', 'O''Reilly', 'a $ b' FROM dw.dim_date",
+                "SELECT * FROM dw.dim_artist WHERE name = 'O''Reilly'",
+                "SELECT E'abc pg_sleep(1)' FROM dw.dim_date",
+                "SELECT d.current_user_x FROM dw.dim_date d"
+        };
+        for (String q : queries) {
+            GuardResult r = guard.check(q);
+            assertThat(r.allowed()).as("%s -> %s", q, r.reason()).isTrue();
+        }
+    }
+
+    @Test
+    void fetchFirstBecomesCappedLimit() {
+        GuardResult small = guard.check("SELECT * FROM dw.fact_sales FETCH FIRST 10 ROWS ONLY");
+        assertThat(small.allowed()).as(small.reason()).isTrue();
+        assertThat(small.safeSql()).contains("LIMIT 10").doesNotContain("FETCH").doesNotContain("1000");
+
+        GuardResult big = guard.check("SELECT * FROM dw.fact_sales FETCH FIRST 5000 ROWS ONLY");
+        assertThat(big.allowed()).as(big.reason()).isTrue();
+        assertThat(big.safeSql()).contains("LIMIT 1000").doesNotContain("FETCH").doesNotContain("5000");
+
+        GuardResult ties = guard.check("SELECT * FROM dw.fact_sales ORDER BY sales_key FETCH FIRST 5 ROWS WITH TIES");
+        assertThat(ties.allowed()).as(ties.reason()).isTrue();
+        assertThat(ties.safeSql()).contains("LIMIT 1000").doesNotContain("FETCH").doesNotContain("TIES");
+
+        GuardResult offset = guard.check("SELECT * FROM dw.fact_sales OFFSET 3 ROWS FETCH NEXT 7 ROWS ONLY");
+        assertThat(offset.allowed()).as(offset.reason()).isTrue();
+        assertThat(offset.safeSql()).contains("LIMIT 7").contains("OFFSET 3").doesNotContain("FETCH");
+
+        GuardResult union = guard.check(
+                "SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales FETCH FIRST 5000 ROWS ONLY");
+        assertThat(union.allowed()).as(union.reason()).isTrue();
+        assertThat(union.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 1000").doesNotContain("FETCH");
+    }
+
     @Test
     void reasonNamesOffendingTableAndFunction() {
         assertThat(guard.check("SELECT * FROM app.users").reason()).contains("app.users");
