@@ -102,11 +102,40 @@ class AuthFlowTest extends PostgresIntegrationTest {
     }
 
     @Test
-    void validTokenPassesSecurity() throws Exception {
-        // No /api/conversations controller yet: anything but 401 proves Security let the request through.
-        int status = mvc.perform(get("/api/conversations").header("Authorization", "Bearer " + token(Duration.ofHours(1))))
-                .andReturn().getResponse().getStatus();
-        assertThat(status).isNotEqualTo(401);
+    void validTokenReachesControllerAndResolvesCurrentUser() throws Exception {
+        mvc.perform(get("/api/test/me").header("Authorization", "Bearer " + token(Duration.ofHours(1))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(1))
+                .andExpect(jsonPath("$.username").value("x"));
+    }
+
+    @Test
+    void frameworkErrorsKeepTheirStatus() throws Exception {
+        String auth = "Bearer " + token(Duration.ofHours(1));
+        mvc.perform(get("/api/does-not-exist").header("Authorization", auth))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.message").value("Không tìm thấy"));
+        mvc.perform(get("/api/auth/login").header("Authorization", auth))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(jsonPath("$.message").value("Phương thức không được hỗ trợ"));
+        mvc.perform(post("/api/auth/login").contentType(MediaType.TEXT_PLAIN).content("x").header("Authorization", auth))
+                .andExpect(status().isUnsupportedMediaType());
+    }
+
+    @Test
+    void staleBearerTokenDoesNotBlockAuthEndpoints() throws Exception {
+        register("frank", "password1", 201);
+        mvc.perform(post("/api/auth/login").header("Authorization", "Bearer x")
+                        .contentType(MediaType.APPLICATION_JSON).content(body("frank", "password1")))
+                .andExpect(status().isOk());
+        mvc.perform(post("/api/auth/login").header("Authorization", "Bearer " + token(Duration.ofMinutes(-10)))
+                        .contentType(MediaType.APPLICATION_JSON).content(body("frank", "password1")))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void blankPasswordIsRejectedOnRegister() throws Exception {
+        register("gina", "        ", 400);
     }
 
     @Test

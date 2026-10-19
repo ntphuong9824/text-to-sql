@@ -1,6 +1,7 @@
 package com.fsoft.training.auth;
 
 import java.util.Optional;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 
@@ -24,12 +25,16 @@ public class UserRepository {
                 .optional();
     }
 
-    /** @throws org.springframework.dao.DuplicateKeyException when the username is taken */
+    /** @throws UsernameTakenException when the username is taken */
     public long create(String username, String passwordHash) {
-        return jdbc.sql("insert into app.users(username, password_hash) values (:username, :hash) returning id")
-                .param("username", username)
-                .param("hash", passwordHash)
-                .query(Long.class)
-                .single();
+        try {
+            return jdbc.sql("insert into app.users(username, password_hash) values (:username, :hash) returning id")
+                    .param("username", username)
+                    .param("hash", passwordHash)
+                    .query(Long.class)
+                    .single();
+        } catch (DuplicateKeyException e) {
+            throw new UsernameTakenException(username);
+        }
     }
 }

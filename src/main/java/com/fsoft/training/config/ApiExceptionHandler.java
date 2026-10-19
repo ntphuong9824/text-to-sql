@@ -4,7 +4,8 @@ import com.fsoft.training.auth.AuthDtos.ErrorResponse;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DuplicateKeyException;
+import com.fsoft.training.auth.UsernameTakenException;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -37,13 +38,30 @@ public class ApiExceptionHandler {
         return badRequest("Nội dung yêu cầu không hợp lệ");
     }
 
-    @ExceptionHandler(DuplicateKeyException.class)
-    ResponseEntity<ErrorResponse> onDuplicate(DuplicateKeyException ex) {
+    @ExceptionHandler(UsernameTakenException.class)
+    ResponseEntity<ErrorResponse> onUsernameTaken(UsernameTakenException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(new ErrorResponse("Tên đăng nhập đã tồn tại"));
+    }
+
+    private static String messageFor(HttpStatusCode status) {
+        return switch (status.value()) {
+            case 400 -> "Yêu cầu không hợp lệ";
+            case 404 -> "Không tìm thấy";
+            case 405 -> "Phương thức không được hỗ trợ";
+            case 415 -> "Định dạng nội dung không được hỗ trợ";
+            default -> status.is5xxServerError()
+                    ? "Đã xảy ra lỗi hệ thống, vui lòng thử lại sau" : "Yêu cầu không thể xử lý";
+        };
     }
 
     @ExceptionHandler(Exception.class)
     ResponseEntity<ErrorResponse> onUnexpected(Exception ex) {
+        // Spring MVC exceptions (404, 405, 415, 400...) implement ErrorResponse and carry their own status.
+        if (ex instanceof org.springframework.web.ErrorResponse withStatus) {
+            HttpStatusCode status = withStatus.getStatusCode();
+            log.debug("Request failed with status {}", status, ex);
+            return ResponseEntity.status(status).body(new ErrorResponse(messageFor(status)));
+        }
         log.error("Unexpected error", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(new ErrorResponse("Đã xảy ra lỗi hệ thống, vui lòng thử lại sau"));

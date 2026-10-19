@@ -22,6 +22,8 @@ import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
+import org.springframework.security.oauth2.server.resource.web.BearerTokenResolver;
+import org.springframework.security.oauth2.server.resource.web.DefaultBearerTokenResolver;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.web.cors.CorsConfiguration;
@@ -49,9 +51,17 @@ public class SecurityConfig {
                         .anyRequest().denyAll())
                 .oauth2ResourceServer(o -> o
                         .authenticationEntryPoint(unauthorized)
+                        .bearerTokenResolver(bearerTokenResolver())
                         .jwt(Customizer.withDefaults()))
                 .exceptionHandling(e -> e.authenticationEntryPoint(unauthorized));
         return http.build();
+    }
+
+    /** Ignores any Authorization header on /api/auth/**, so a stale token cannot block logging in again. */
+    private static BearerTokenResolver bearerTokenResolver() {
+        DefaultBearerTokenResolver delegate = new DefaultBearerTokenResolver();
+        return request -> request.getRequestURI().startsWith(request.getContextPath() + "/api/auth/")
+                ? null : delegate.resolve(request);
     }
 
     @Bean
