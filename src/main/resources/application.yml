@@ -1,0 +1,19 @@
+spring:
+  application:
+    name: text-to-sql
+  flyway:
+    schemas: app
+    default-schema: app
+    locations: classpath:db/migration
+    fail-on-missing-locations: false
+
+app:
+  datasource:
+    app:
+      url: jdbc:postgresql://localhost:5432/textsql
+      username: ${APP_DB_USER:app_rw}
+      password: ${APP_DB_PASSWORD:app_rw_dev}
+    analyst:
+      url: jdbc:postgresql://localhost:5432/textsql
+      username: ${ANALYST_DB_USER:analyst_ro}
+      password: ${ANALYST_DB_PASSWORD:analyst_ro_dev}

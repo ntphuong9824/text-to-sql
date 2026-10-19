@@ -1,0 +1,38 @@
+package com.fsoft.training.support;
+
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+import org.testcontainers.utility.MountableFile;
+
+/**
+ * Base class for integration tests. One Postgres container (with db/init scripts applied)
+ * is shared by every subclass in the JVM.
+ */
+@SpringBootTest
+public abstract class PostgresIntegrationTest {
+
+    protected static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.6")
+            .withDatabaseName("textsql")
+            .withUsername("postgres")
+            .withPassword("postgres")
+            .withCopyFileToContainer(MountableFile.forHostPath("db/init"), "/docker-entrypoint-initdb.d/");
+
+    static {
+        POSTGRES.start();
+    }
+
+    @DynamicPropertySource
+    static void datasourceProperties(DynamicPropertyRegistry registry) {
+        registry.add("app.datasource.app.url", POSTGRES::getJdbcUrl);
+        registry.add("app.datasource.analyst.url", POSTGRES::getJdbcUrl);
+    }
+
+    protected JdbcTemplate superuserJdbc() {
+        return new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
+    }
+}

@@ -1,9 +1,15 @@
 services:
   postgres:
-    image: 'postgres:latest'
+    image: 'postgres:17.6'
     environment:
-      - 'POSTGRES_DB=mydatabase'
-      - 'POSTGRES_PASSWORD=secret'
-      - 'POSTGRES_USER=myuser'
+      - 'POSTGRES_DB=textsql'
+      - 'POSTGRES_USER=postgres'
+      - 'POSTGRES_PASSWORD=postgres'
     ports:
-      - '5432'
+      - '5432:5432'
+    volumes:
+      - './db/init:/docker-entrypoint-initdb.d:ro'
+      - 'pgdata:/var/lib/postgresql/data'
+
+volumes:
+  pgdata:
