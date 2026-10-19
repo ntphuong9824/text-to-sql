@@ -403,4 +403,59 @@ class SqlGuardTest {
             assertThat(r.safeSql()).contains("LIMIT 1000");
         }
     }
+
+    // ---- round 4 ----
+
+    @Test
+    void fetchFirstWithoutCountIsOneRow() {
+        GuardResult r = guard.check("SELECT * FROM dw.dim_date FETCH FIRST ROWS ONLY");
+        assertThat(r.allowed()).as(r.reason()).isTrue();
+        assertThat(r.safeSql()).containsOnlyOnce("LIMIT").endsWith("LIMIT 1").doesNotContain("FETCH");
+
+        GuardResult one = guard.check("SELECT * FROM dw.dim_date FETCH NEXT 1 ROW ONLY");
+        assertThat(one.allowed()).as(one.reason()).isTrue();
+        assertThat(one.safeSql()).containsOnlyOnce("LIMIT").endsWith("LIMIT 1").doesNotContain("FETCH");
+    }
+
+    @Test
+    void checkNeverThrowsWhenAnInternalStepFails() {
+        SqlGuard failing = new SqlGuard() {
+            @Override
+            GuardResult checkUnguarded(String sql) {
+                throw new IllegalStateException("boom");
+            }
+        };
+        GuardResult r = failing.check("SELECT * FROM dw.dim_date");
+        assertThat(r.allowed()).isFalse();
+        assertThat(r.reason()).isEqualTo("Không kiểm tra được câu SQL");
+    }
+
+    @Test
+    void astInspectionBlocksKeywordColumnsWithoutTheLexer() {
+        assertThat(SqlGuard.astKeywordColumn("SELECT current_user FROM dw.dim_date")).contains("current_user");
+        assertThat(SqlGuard.astKeywordColumn("SELECT x FROM dw.dim_date WHERE session_user = 'a'"))
+                .contains("session_user");
+        assertThat(SqlGuard.astKeywordColumn("SELECT d.user FROM dw.dim_date d")).isEmpty();
+        assertThat(SqlGuard.astKeywordColumn("SELECT \"user\" FROM dw.dim_date")).isEmpty();
+        assertThat(SqlGuard.astKeywordColumn("SELECT date_key FROM dw.dim_date")).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "SELECT a FROM dw.dim_date UNION TABLE app.users",
+            "WITH x AS (TABLE app.users) SELECT * FROM x",
+            "SELECT * FROM dw.dim_date WHERE 1 IN (TABLE users)"
+    })
+    void blocksNestedTableForms(String sql) {
+        GuardResult r = guard.check(sql);
+        assertThat(r.allowed()).as(sql).isFalse();
+        assertThat(r.reason()).isNotBlank();
+    }
+
+    @Test
+    void lineCommentEndsAtCarriageReturn() {
+        assertThat(SqlGuard.lexicalBackstop("SELECT x FROM dw.dim_date -- c\r, pg_sleep(1)")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT x FROM dw.dim_date -- c\rWHERE current_user = 'a'")).isPresent();
+        assertThat(SqlGuard.lexicalBackstop("SELECT x FROM dw.dim_date -- pg_sleep(1)\r")).isEmpty();
+    }
 }

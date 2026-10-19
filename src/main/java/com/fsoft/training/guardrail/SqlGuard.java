@@ -78,7 +78,30 @@ public class SqlGuard {
             "pg_", "lo_", "dblink",
             "query_to_", "table_to_", "cursor_to_", "schema_to_", "database_to_");
 
+    /** Never throws: any unexpected failure inside the checks blocks the SQL (fail closed). */
     public GuardResult check(String sql) {
+        try {
+            return checkUnguarded(sql);
+        } catch (RuntimeException | StackOverflowError e) {
+            return GuardResult.blocked("Không kiểm tra được câu SQL");
+        }
+    }
+
+    /** AST-only keyword-column inspection (no lexical backstop), exposed for tests. */
+    static Optional<String> astKeywordColumn(String sql) {
+        Statement statement;
+        try {
+            statement = CCJSqlParserUtil.parse(sql);
+        } catch (JSQLParserException e) {
+            throw new IllegalArgumentException(e);
+        }
+        Inspector inspector = new Inspector();
+        inspector.walk((Select) statement);
+        return Optional.ofNullable(inspector.keywordColumn);
+    }
+
+    /** All checks; may throw on unexpected parser/AST states, which {@link #check} turns into a block. */
+    GuardResult checkUnguarded(String sql) {
         if (sql == null || sql.isBlank()) {
             return GuardResult.blocked("SQL rỗng, không có gì để chạy.");
         }
@@ -179,7 +202,7 @@ public class SqlGuard {
                 return Optional.of(DOLLAR_REASON);
             }
             if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
-                while (i < n && sql.charAt(i) != '\n') {
+                while (i < n && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') {
                     i++;
                 }
                 continue;
@@ -315,7 +338,10 @@ public class SqlGuard {
         limit.setRowCount(new LongValue(cap));
     }
 
-    /** Row count of FETCH FIRST n ROWS ONLY; anything else (WITH TIES, expression) counts as MAX_ROWS. */
+    /**
+     * Row count of FETCH FIRST n ROWS ONLY; no count means 1 row (Postgres default); anything else
+     * (WITH TIES, expression, parameter) counts as MAX_ROWS.
+     */
     private static long fetchRows(Fetch fetch) {
         if (fetch.toString().toUpperCase(Locale.ROOT).contains("TIES")) {
             return MAX_ROWS;
@@ -323,8 +349,7 @@ public class SqlGuard {
         if (fetch.getExpression() instanceof LongValue rows) {
             return rows.getValue();
         }
-        return fetch.getExpression() == null && fetch.getFetchJdbcParameter() == null
-                ? fetch.getRowCount() : MAX_ROWS;
+        return fetch.getExpression() == null && fetch.getFetchJdbcParameter() == null ? 1 : MAX_ROWS;
     }
 
     /** Postgres folding: unquoted identifiers lowercase, quoted ones compare exactly. */
