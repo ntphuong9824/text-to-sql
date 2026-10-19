@@ -2,7 +2,8 @@ package com.fsoft.training.llm;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import java.net.http.HttpClient;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
 @Configuration(proxyBeanMethods = false)
@@ -15,10 +16,13 @@ class LlmConfig {
 
     @Bean
     LlmClient llmClient(RestClient.Builder builder, LlmProperties properties, Sleeper sleeper) {
-        var factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(properties.timeout());
+        return create(builder, properties, sleeper);
+    }
+
+    static OpenAiCompatibleLlmClient create(RestClient.Builder builder, LlmProperties properties, Sleeper sleeper) {
+        HttpClient httpClient = HttpClient.newBuilder().connectTimeout(properties.timeout()).build();
+        var factory = new JdkClientHttpRequestFactory(httpClient);
         factory.setReadTimeout(properties.timeout());
-        RestClient.Builder configured = builder.clone().requestFactory(factory);
-        return new OpenAiCompatibleLlmClient(configured, properties, sleeper);
+        return new OpenAiCompatibleLlmClient(builder.clone().requestFactory(factory), properties, sleeper);
     }
 }
