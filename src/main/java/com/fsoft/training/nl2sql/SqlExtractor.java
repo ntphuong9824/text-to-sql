@@ -7,7 +7,9 @@ import java.util.regex.Pattern;
 /** Pulls a single SQL statement out of free-form LLM text. */
 public final class SqlExtractor {
 
-    private static final Pattern FENCE = Pattern.compile("```[a-zA-Z]*[ \\t]*\\R?(.*?)```", Pattern.DOTALL);
+    // A language tag counts only when a newline follows it, so "```SELECT a```" keeps "SELECT".
+    private static final Pattern FENCE = Pattern.compile("```(?:[\\w+-]*[ \\t]*\\R)?(.*?)```", Pattern.DOTALL);
+    private static final Pattern OPEN_FENCE = Pattern.compile("^```(?:[\\w+-]*[ \\t]*\\R)?");
     private static final Pattern REFUSE = Pattern.compile("^\\s*--\\s*REFUSE\\s*:?\\s*(.*)$", Pattern.DOTALL);
 
     private SqlExtractor() {}
@@ -36,6 +38,11 @@ public final class SqlExtractor {
         Matcher fence = FENCE.matcher(text);
         if (fence.find()) {
             text = fence.group(1).strip();
+        } else if (text.startsWith("```")) {
+            text = OPEN_FENCE.matcher(text).replaceFirst("").strip();
+            if (text.endsWith("```")) {
+                text = text.substring(0, text.length() - 3).strip();
+            }
         }
         while (text.endsWith(";")) {
             text = text.substring(0, text.length() - 1).stripTrailing();

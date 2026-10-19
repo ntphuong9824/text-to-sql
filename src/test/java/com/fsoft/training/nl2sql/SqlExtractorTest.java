@@ -41,4 +41,20 @@ class SqlExtractorTest {
         String sql = "WITH t AS (SELECT 1 AS a) SELECT a FROM t";
         assertThat(SqlExtractor.extract(sql)).contains(sql);
     }
+
+    @Test
+    void singleLineFenceKeepsFirstWord() {
+        assertThat(SqlExtractor.extract("```SELECT a FROM dw.x```")).contains("SELECT a FROM dw.x");
+    }
+
+    @Test
+    void hyphenatedLanguageTagIsStripped() {
+        assertThat(SqlExtractor.extract("```sql-postgres\nSELECT a FROM dw.x\n```")).contains("SELECT a FROM dw.x");
+    }
+
+    @Test
+    void unclosedFenceIsStripped() {
+        assertThat(SqlExtractor.extract("```sql\nSELECT a FROM dw.x;")).contains("SELECT a FROM dw.x");
+        assertThat(SqlExtractor.extract("```\nSELECT a FROM dw.x")).contains("SELECT a FROM dw.x");
+    }
 }
