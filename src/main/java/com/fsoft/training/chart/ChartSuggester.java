@@ -27,7 +27,7 @@ public class ChartSuggester {
         int rowCount = r.rows().size();
 
         if (rowCount == 1 && cols.size() == 1 && isNumber(cols.get(0))) {
-            return new ChartSpec(ChartType.KPI, null, null);
+            return new ChartSpec(ChartType.KPI, null, cols.get(0).name());
         }
         if (cols.size() != 2) {
             return TABLE;

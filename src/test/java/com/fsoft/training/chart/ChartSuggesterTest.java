@@ -35,7 +35,7 @@ class ChartSuggesterTest {
     @Test
     void oneRowOneNumberColumnIsKpi() {
         var r = qr(List.of(col("total", "number")), List.of(row(new BigDecimal("12.5"))));
-        assertThat(suggester.suggest(r)).isEqualTo(new ChartSpec(ChartType.KPI, null, null));
+        assertThat(suggester.suggest(r)).isEqualTo(new ChartSpec(ChartType.KPI, null, "total"));
     }
 
     @Test

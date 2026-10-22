@@ -24,6 +24,7 @@ describe('ResultChart', () => {
       />,
     )
     expect(screen.getByText((1234567).toLocaleString('vi-VN'))).toBeInTheDocument()
+    expect(screen.getByText('total')).toBeInTheDocument()
   })
 
   it('renders nothing for TABLE', () => {

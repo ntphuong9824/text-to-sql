@@ -79,6 +79,10 @@ class ChatApiTest extends PostgresIntegrationTest {
         assertThat(turn.get("status").asString()).isEqualTo("OK");
         assertThat(turn.get("result").get("rows")).hasSize(4);
         assertThat(turn.get("chart").get("type").asString()).isEqualTo("BAR");
+        // Wire contract with the frontend: JSON property names must not change.
+        assertThat(turn.get("chart").has("xColumn")).isTrue();
+        assertThat(turn.get("chart").has("yColumn")).isTrue();
+        assertThat(turn.get("result").get("truncated").asBoolean()).isFalse();
         assertThat(turn.get("createdAt").asString())
                 .matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z");
     }
