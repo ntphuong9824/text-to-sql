@@ -1,0 +1,12 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 2rem;
+}
+
+label {
+  display: block;
+}
+
+[role='alert'] {
+  color: #b00020;
+}
