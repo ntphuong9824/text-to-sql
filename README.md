@@ -233,7 +233,7 @@ Kiểm thử end-to-end trên trình duyệt (Playwright) với Gemini thật, �
 - Runner gọi thẳng `Nl2SqlPipeline` (không qua HTTP, không ghi vào lịch sử người dùng), giãn cách `eval.delay-ms`
   (mặc định 4500 ms) giữa các lượt gọi để hợp với hạn mức free tier.
 
-Chạy (cần Postgres đang chạy và `LLM_API_KEY`):
+Chạy (cần Postgres đang chạy, `LLM_API_KEY` và cả `JWT_SECRET`: `JwtProperties` dừng ngay khi khởi động nếu thiếu, kể cả với profile `eval`; cả hai đặt trong `.env` theo bước 1):
 
 ```bash
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=eval
