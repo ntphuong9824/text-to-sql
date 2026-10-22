@@ -1,0 +1,455 @@
+# Review package: 40353b1..HEAD
+
+## Commits
+dbd297b feat(warehouse): add read-only SQL executor with planner-based policy check
+
+## Files changed
+ .../com/fsoft/training/warehouse/ColumnInfo.java   |   5 +
+ .../fsoft/training/warehouse/PlanInspector.java    | 116 +++++++++++++++++++++
+ .../com/fsoft/training/warehouse/QueryResult.java  |   6 ++
+ .../training/warehouse/SqlExecutionException.java  |   9 ++
+ .../com/fsoft/training/warehouse/SqlExecutor.java  | 110 +++++++++++++++++++
+ .../warehouse/SqlPolicyViolationException.java     |   9 ++
+ .../training/warehouse/PlanInspectorTest.java      |  57 ++++++++++
+ .../fsoft/training/warehouse/SqlExecutorTest.java  |  78 ++++++++++++++
+ 8 files changed, 390 insertions(+)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/warehouse/ColumnInfo.java b/src/main/java/com/fsoft/training/warehouse/ColumnInfo.java
+new file mode 100644
+index 0000000..7862464
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/warehouse/ColumnInfo.java
+@@ -0,0 +1,5 @@
++package com.fsoft.training.warehouse;
++
++/** @param type one of "number", "text", "date", "boolean" */
++public record ColumnInfo(String name, String type) {
++}
+diff --git a/src/main/java/com/fsoft/training/warehouse/PlanInspector.java b/src/main/java/com/fsoft/training/warehouse/PlanInspector.java
+new file mode 100644
+index 0000000..e193dc7
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/warehouse/PlanInspector.java
+@@ -0,0 +1,116 @@
++package com.fsoft.training.warehouse;
++
++import com.fsoft.training.guardrail.SqlGuard;
++import java.util.Locale;
++import java.util.Optional;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Component;
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.json.JsonMapper;
++
++/**
++ * Second guardrail layer: asks the Postgres planner (EXPLAIN) what the query really touches, so name,
++ * schema, CTE and view resolution is done by Postgres rather than by walking the SQL AST.
++ */
++@Component
++public class PlanInspector {
++
++    private static final String ALLOWED_SCHEMA = "dw";
++    private static final Pattern CALL = Pattern.compile("([A-Za-z_][A-Za-z0-9_$]*)\\s*\\(");
++
++    private final JdbcTemplate jdbc;
++    private final JsonMapper mapper = JsonMapper.builder().build();
++
++    public PlanInspector(@Qualifier("analyst") JdbcTemplate analystJdbcTemplate) {
++        this.jdbc = analystJdbcTemplate;
++    }
++
++    /** @return a Vietnamese reason if the plan breaks policy; empty if fine or if EXPLAIN itself fails. */
++    public Optional<String> violation(String safeSql) {
++        String json;
++        try {
++            json = jdbc.queryForObject("EXPLAIN (VERBOSE, FORMAT JSON) " + safeSql, String.class);
++        } catch (RuntimeException e) {
++            return Optional.empty();
++        }
++        if (json == null) {
++            return Optional.empty();
++        }
++        return Optional.ofNullable(walk(mapper.readTree(json)));
++    }
++
++    private String walk(JsonNode node) {
++        if (node.isObject()) {
++            JsonNode relation = node.get("Relation Name");
++            if (relation != null && relation.isString()) {
++                JsonNode schema = node.get("Schema");
++                String schemaName = schema != null && schema.isString() ? schema.asString() : "?";
++                if (!ALLOWED_SCHEMA.equals(schemaName)) {
++                    return "Truy vấn đọc bảng '" + schemaName + "." + relation.asString()
++                            + "' ngoài schema được phép (" + ALLOWED_SCHEMA + ").";
++                }
++            }
++            JsonNode function = node.get("Function Name");
++            if (function != null && function.isString()) {
++                String name = function.asString().toLowerCase(Locale.ROOT);
++                if (SqlGuard.isBlockedFunction(name)) {
++                    return blocked(name);
++                }
++            }
++            for (var entry : node.properties()) {
++                String reason = walk(entry.getValue());
++                if (reason != null) {
++                    return reason;
++                }
++            }
++        } else if (node.isArray()) {
++            for (JsonNode child : node) {
++                String reason = walk(child);
++                if (reason != null) {
++                    return reason;
++                }
++            }
++        } else if (node.isString()) {
++            return scanText(node.asString());
++        }
++        return null;
++    }
++
++    private static String scanText(String text) {
++        Matcher m = CALL.matcher(stripLiterals(text));
++        while (m.find()) {
++            String name = m.group(1).toLowerCase(Locale.ROOT);
++            if (SqlGuard.isBlockedFunction(name)) {
++                return blocked(name);
++            }
++        }
++        return null;
++    }
++
++    /** Removes single-quoted literals ('' is an escaped quote) so strings never look like calls. */
++    private static String stripLiterals(String text) {
++        StringBuilder sb = new StringBuilder(text.length());
++        boolean in = false;
++        for (int i = 0; i < text.length(); i++) {
++            char c = text.charAt(i);
++            if (c == '\'') {
++                if (in && i + 1 < text.length() && text.charAt(i + 1) == '\'') {
++                    i++;
++                } else {
++                    in = !in;
++                    sb.append(' ');
++                }
++            } else if (!in) {
++                sb.append(c);
++            }
++        }
++        return sb.toString();
++    }
++
++    private static String blocked(String name) {
++        return "Hàm '" + name + "' bị cấm vì lý do an toàn.";
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/warehouse/QueryResult.java b/src/main/java/com/fsoft/training/warehouse/QueryResult.java
+new file mode 100644
+index 0000000..ab24fd9
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/warehouse/QueryResult.java
+@@ -0,0 +1,6 @@
++package com.fsoft.training.warehouse;
++
++import java.util.List;
++
++public record QueryResult(List<ColumnInfo> columns, List<List<Object>> rows, boolean truncated) {
++}
+diff --git a/src/main/java/com/fsoft/training/warehouse/SqlExecutionException.java b/src/main/java/com/fsoft/training/warehouse/SqlExecutionException.java
+new file mode 100644
+index 0000000..977beb9
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/warehouse/SqlExecutionException.java
+@@ -0,0 +1,9 @@
++package com.fsoft.training.warehouse;
++
++/** Postgres rejected or failed the query; the message is the original database error (used for self-repair). */
++public class SqlExecutionException extends RuntimeException {
++
++    public SqlExecutionException(String message, Throwable cause) {
++        super(message, cause);
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/warehouse/SqlExecutor.java b/src/main/java/com/fsoft/training/warehouse/SqlExecutor.java
+new file mode 100644
+index 0000000..4378648
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/warehouse/SqlExecutor.java
+@@ -0,0 +1,110 @@
++package com.fsoft.training.warehouse;
++
++import java.math.BigDecimal;
++import java.sql.Connection;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.ResultSetMetaData;
++import java.sql.SQLException;
++import java.sql.Types;
++import java.time.LocalDate;
++import java.time.LocalDateTime;
++import java.time.OffsetDateTime;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Optional;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.dao.DataAccessException;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Component;
++
++/** Runs guard-approved SQL through the read-only analyst connection. */
++@Component
++public class SqlExecutor {
++
++    static final int MAX_ROWS = 1000;
++    static final int TIMEOUT_SECONDS = 10;
++
++    private final JdbcTemplate jdbc;
++    private final PlanInspector planInspector;
++
++    public SqlExecutor(@Qualifier("analyst") JdbcTemplate analystJdbcTemplate, PlanInspector planInspector) {
++        this.jdbc = analystJdbcTemplate;
++        this.planInspector = planInspector;
++    }
++
++    public QueryResult execute(String safeSql) {
++        Optional<String> violation = planInspector.violation(safeSql);
++        if (violation.isPresent()) {
++            throw new SqlPolicyViolationException(violation.get());
++        }
++        try {
++            return jdbc.execute((Connection con) -> {
++                try (PreparedStatement ps = con.prepareStatement(safeSql)) {
++                    ps.setMaxRows(MAX_ROWS + 1);
++                    ps.setQueryTimeout(TIMEOUT_SECONDS);
++                    try (ResultSet rs = ps.executeQuery()) {
++                        return read(rs);
++                    }
++                }
++            });
++        } catch (DataAccessException e) {
++            throw new SqlExecutionException(e.getMostSpecificCause().getMessage(), e);
++        }
++    }
++
++    private static QueryResult read(ResultSet rs) throws SQLException {
++        ResultSetMetaData md = rs.getMetaData();
++        int n = md.getColumnCount();
++        List<ColumnInfo> columns = new ArrayList<>(n);
++        for (int i = 1; i <= n; i++) {
++            columns.add(new ColumnInfo(md.getColumnLabel(i), typeOf(md.getColumnType(i))));
++        }
++        List<List<Object>> rows = new ArrayList<>();
++        boolean truncated = false;
++        while (rs.next()) {
++            if (rows.size() == MAX_ROWS) {
++                truncated = true;
++                break;
++            }
++            List<Object> row = new ArrayList<>(n);
++            for (int i = 1; i <= n; i++) {
++                row.add(value(rs, i, md.getColumnType(i)));
++            }
++            rows.add(row);
++        }
++        return new QueryResult(columns, rows, truncated);
++    }
++
++    static String typeOf(int sqlType) {
++        return switch (sqlType) {
++            case Types.TINYINT, Types.SMALLINT, Types.INTEGER, Types.BIGINT, Types.NUMERIC, Types.DECIMAL,
++                 Types.FLOAT, Types.REAL, Types.DOUBLE -> "number";
++            case Types.DATE, Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE -> "date";
++            case Types.BOOLEAN, Types.BIT -> "boolean";
++            default -> "text";
++        };
++    }
++
++    private static Object value(ResultSet rs, int i, int sqlType) throws SQLException {
++        Object raw = switch (sqlType) {
++            case Types.DATE -> rs.getObject(i, LocalDate.class);
++            case Types.TIMESTAMP -> rs.getObject(i, LocalDateTime.class);
++            case Types.TIMESTAMP_WITH_TIMEZONE -> rs.getObject(i, OffsetDateTime.class);
++            default -> rs.getObject(i);
++        };
++        if (raw == null) {
++            return null;
++        }
++        return switch (raw) {
++            case Short v -> v.longValue();
++            case Integer v -> v.longValue();
++            case Long v -> v;
++            case BigDecimal v -> v;
++            case Float v -> BigDecimal.valueOf(v.doubleValue());
++            case Double v -> v.isNaN() || v.isInfinite() ? v.toString() : BigDecimal.valueOf(v);
++            case Boolean v -> v;
++            default -> raw.toString();
++        };
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/warehouse/SqlPolicyViolationException.java b/src/main/java/com/fsoft/training/warehouse/SqlPolicyViolationException.java
+new file mode 100644
+index 0000000..f712768
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/warehouse/SqlPolicyViolationException.java
+@@ -0,0 +1,9 @@
++package com.fsoft.training.warehouse;
++
++/** The query plan touches something outside the allowed surface. Deliberately not a SqlExecutionException. */
++public class SqlPolicyViolationException extends RuntimeException {
++
++    public SqlPolicyViolationException(String reason) {
++        super(reason);
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/warehouse/PlanInspectorTest.java b/src/test/java/com/fsoft/training/warehouse/PlanInspectorTest.java
+new file mode 100644
+index 0000000..0e6160f
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/warehouse/PlanInspectorTest.java
+@@ -0,0 +1,57 @@
++package com.fsoft.training.warehouse;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.fsoft.training.support.PostgresIntegrationTest;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++
++class PlanInspectorTest extends PostgresIntegrationTest {
++
++    @Autowired
++    PlanInspector inspector;
++
++    @Test
++    void pgUserViewIsCaughtAsPgCatalog() {
++        assertThat(inspector.violation("SELECT * FROM pg_user"))
++                .hasValueSatisfying(r -> assertThat(r).contains("pg_catalog"));
++    }
++
++    @Test
++    void cteShadowingDoesNotHidePgUser() {
++        assertThat(inspector.violation("WITH \"PG_USER\" AS (SELECT 1) SELECT * FROM pg_user")).isPresent();
++    }
++
++    @Test
++    void crossJoinInParensIsCaught() {
++        assertThat(inspector.violation("SELECT * FROM (dw.dim_date d CROSS JOIN pg_user)")).isPresent();
++    }
++
++    @Test
++    void blockedFunctionInFilterIsCaught() {
++        assertThat(inspector.violation("SELECT 1 FROM dw.dim_date WHERE pg_sleep(0) IS NULL")).isPresent();
++    }
++
++    @Test
++    void literalNamedLikeBlockedFunctionIsNotAFalsePositive() {
++        assertThat(inspector.violation("SELECT 1 FROM dw.dim_date WHERE month_name = 'pg_sleep(1)'")).isEmpty();
++    }
++
++    @Test
++    void normalAggregateIsAllowed() {
++        assertThat(inspector.violation("SELECT region, sum(revenue) FROM dw.fact_sales f "
++                + "JOIN dw.dim_customer c USING (customer_key) GROUP BY region")).isEmpty();
++    }
++
++    @Test
++    void cteAndWindowFunctionAreAllowed() {
++        assertThat(inspector.violation("WITH t AS (SELECT date_key, sum(revenue) r FROM dw.fact_sales GROUP BY date_key) "
++                + "SELECT date_key, r, rank() OVER (ORDER BY r DESC) FROM t")).isEmpty();
++    }
++
++    @Test
++    void explainFailureReturnsEmpty() {
++        assertThat(inspector.violation("SELECT * FROM chinook.album")).isEmpty();
++        assertThat(inspector.violation("SELECT nope FROM dw.dim_date")).isEmpty();
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/warehouse/SqlExecutorTest.java b/src/test/java/com/fsoft/training/warehouse/SqlExecutorTest.java
+new file mode 100644
+index 0000000..26fdaf0
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/warehouse/SqlExecutorTest.java
+@@ -0,0 +1,78 @@
++package com.fsoft.training.warehouse;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.fsoft.training.support.PostgresIntegrationTest;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import tools.jackson.databind.json.JsonMapper;
++
++class SqlExecutorTest extends PostgresIntegrationTest {
++
++    @Autowired
++    SqlExecutor executor;
++
++    private static final String BY_REGION = "select region, sum(revenue) as revenue from dw.fact_sales f "
++            + "join dw.dim_customer c on c.customer_key=f.customer_key group by region";
++
++    @Test
++    void groupByRegionHasFourRowsAndNumericSecondColumn() {
++        QueryResult r = executor.execute(BY_REGION);
++        assertThat(r.rows()).hasSize(4);
++        assertThat(r.columns().get(1).type()).isEqualTo("number");
++        assertThat(r.columns().get(0).type()).isEqualTo("text");
++    }
++
++    @Test
++    void zeroRowsKeepsColumns() {
++        QueryResult r = executor.execute("select * from dw.dim_date where 1=0");
++        assertThat(r.rows()).isEmpty();
++        assertThat(r.columns()).hasSize(7);
++        assertThat(r.truncated()).isFalse();
++    }
++
++    @Test
++    void dateColumnIsIsoString() {
++        QueryResult r = executor.execute("select full_date from dw.dim_date order by full_date limit 1");
++        assertThat(r.columns().get(0).type()).isEqualTo("date");
++        assertThat((String) r.rows().get(0).get(0)).matches("\\d{4}-\\d{2}-\\d{2}");
++    }
++
++    @Test
++    void nullStaysNull() {
++        QueryResult r = executor.execute("select null::text as a, 1 as b");
++        assertThat(r.rows().get(0).get(0)).isNull();
++        assertThat(r.rows().get(0).get(1)).isEqualTo(1L);
++    }
++
++    @Test
++    void truncationDependsOnLimit() {
++        QueryResult limited = executor.execute("select * from dw.fact_sales limit 1000");
++        assertThat(limited.rows()).hasSize(1000);
++        assertThat(limited.truncated()).isFalse();
++        QueryResult unlimited = executor.execute("select * from dw.fact_sales");
++        assertThat(unlimited.rows()).hasSize(1000);
++        assertThat(unlimited.truncated()).isTrue();
++    }
++
++    @Test
++    void unknownColumnThrowsWithPostgresMessage() {
++        assertThatThrownBy(() -> executor.execute("select nope from dw.dim_date"))
++                .isInstanceOf(SqlExecutionException.class)
++                .hasMessageContaining("column");
++    }
++
++    @Test
++    void policyViolationIsNotAnExecutionException() {
++        assertThatThrownBy(() -> executor.execute("SELECT * FROM pg_user"))
++                .isInstanceOf(SqlPolicyViolationException.class)
++                .isNotInstanceOf(SqlExecutionException.class);
++    }
++
++    @Test
++    void resultSerializesToJson() {
++        String json = JsonMapper.builder().build().writeValueAsString(executor.execute(BY_REGION));
++        assertThat(json).contains("\"columns\"").contains("\"truncated\":false");
++    }
++}

@@ -32,4 +32,7 @@ build/
 ### VS Code ###
 .vscode/
 
-.superpowers/
+# App
+.env
+frontend/node_modules/
+frontend/dist/

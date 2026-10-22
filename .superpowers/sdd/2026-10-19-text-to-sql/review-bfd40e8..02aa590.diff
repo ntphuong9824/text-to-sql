@@ -1,0 +1,622 @@
+# Review package: bfd40e8..HEAD
+
+## Commits
+02aa590 fix(guardrail): close round-2 bypasses and add lexical backstop
+
+## Files changed
+ .../com/fsoft/training/guardrail/SqlGuard.java     | 237 +++++++++++++++++++--
+ .../com/fsoft/training/guardrail/SqlGuardTest.java |  96 +++++++++
+ 2 files changed, 314 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/guardrail/SqlGuard.java b/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
+index 0409971..2002b0c 100644
+--- a/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
++++ b/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
+@@ -1,33 +1,44 @@
+ package com.fsoft.training.guardrail;
+ 
+ import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.Deque;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Optional;
+ import java.util.Set;
+ 
+ import net.sf.jsqlparser.JSQLParserException;
+ import net.sf.jsqlparser.expression.AnalyticExpression;
+ import net.sf.jsqlparser.expression.Expression;
+ import net.sf.jsqlparser.expression.Function;
++import net.sf.jsqlparser.expression.JsonAggregateFunction;
++import net.sf.jsqlparser.expression.JsonExpression;
++import net.sf.jsqlparser.expression.JsonFunction;
++import net.sf.jsqlparser.expression.JsonFunctionExpression;
++import net.sf.jsqlparser.expression.JsonKeyValuePair;
+ import net.sf.jsqlparser.expression.LongValue;
+ import net.sf.jsqlparser.expression.WindowDefinition;
+ import net.sf.jsqlparser.expression.WindowElement;
+ import net.sf.jsqlparser.expression.WindowOffset;
++import net.sf.jsqlparser.expression.operators.relational.IsDistinctExpression;
++import net.sf.jsqlparser.expression.operators.relational.JsonOperator;
+ import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+ import net.sf.jsqlparser.schema.Table;
+ import net.sf.jsqlparser.statement.Statement;
+ import net.sf.jsqlparser.statement.Statements;
++import net.sf.jsqlparser.statement.select.FromItemVisitor;
++import net.sf.jsqlparser.statement.select.Join;
+ import net.sf.jsqlparser.statement.select.Limit;
++import net.sf.jsqlparser.statement.select.ParenthesedFromItem;
+ import net.sf.jsqlparser.statement.select.ParenthesedSelect;
+ import net.sf.jsqlparser.statement.select.OrderByElement;
+ import net.sf.jsqlparser.statement.select.PlainSelect;
+ import net.sf.jsqlparser.statement.select.Select;
+ import net.sf.jsqlparser.statement.select.SelectVisitor;
+ import net.sf.jsqlparser.statement.select.SetOperationList;
+ import net.sf.jsqlparser.statement.select.TableFunction;
+ import net.sf.jsqlparser.statement.select.WithItem;
+ import net.sf.jsqlparser.util.deparser.ExpressionDeParser;
+ import net.sf.jsqlparser.util.deparser.SelectDeParser;
+@@ -44,21 +55,25 @@ public class SqlGuard {
+     public static final int MAX_ROWS = 1000;
+ 
+     private static final String ALLOWED_SCHEMA = "dw";
+ 
+     /** Exact names blocked in addition to the prefix/infix families in {@link #isBlockedFunction}. */
+     private static final Set<String> BLOCKED_FUNCTIONS = Set.of(
+             "current_setting", "set_config", "nextval", "setval", "currval", "lastval",
+             "txid_current", "version", "current_user", "session_user",
+             "inet_server_addr", "inet_server_port",
+             "has_table_privilege", "has_schema_privilege", "has_database_privilege",
+-            "to_regclass", "xmlparse");
++            "to_regclass", "xmlparse", "ts_stat", "ts_rewrite");
++
++    /** Keyword forms that the parser reads as plain columns but that expose session information. */
++    private static final Set<String> KEYWORD_COLUMNS = Set.of(
++            "current_user", "session_user", "user", "current_role", "current_schema", "current_catalog");
+ 
+     private static final List<String> BLOCKED_PREFIXES = List.of(
+             "pg_", "lo_", "dblink",
+             "query_to_", "table_to_", "cursor_to_", "schema_to_", "database_to_");
+ 
+     public GuardResult check(String sql) {
+         if (sql == null || sql.isBlank()) {
+             return GuardResult.blocked("SQL rỗng, không có gì để chạy.");
+         }
+         Statements statements;
+@@ -98,57 +113,149 @@ public class SqlGuard {
+             }
+         }
+         if (inspector.hasInto) {
+             return GuardResult.blocked("SELECT ... INTO không được phép (sẽ tạo bảng mới).");
+         }
+         if (inspector.hasLocking || select.getForMode() != null || select.getForUpdateTable() != null) {
+             return GuardResult.blocked("FOR UPDATE/SHARE không được phép (khóa dữ liệu).");
+         }
+ 
+         applyLimit(select);
+-        return GuardResult.allowed(select.toString());
++        String safeSql = select.toString();
++        Optional<String> backstop = lexicalBackstop(safeSql);
++        if (backstop.isPresent()) {
++            return GuardResult.blocked(backstop.get());
++        }
++        return GuardResult.allowed(safeSql);
+     }
+ 
+     /** @param name unquoted, lowercased, schema-stripped function name */
+-    static boolean isBlockedFunction(String name) {
++    public static boolean isBlockedFunction(String name) {
+         if (BLOCKED_FUNCTIONS.contains(name) || name.contains("_to_xml")) {
+             return true;
+         }
+         return BLOCKED_PREFIXES.stream().anyMatch(name::startsWith);
+     }
+ 
++    /**
++     * Fail-closed lexical layer over the deparsed SQL, independent of the AST walk: string literals are
++     * skipped; identifiers (quoted or not) are checked for blocked function calls, pg_* / information_schema
++     * names and session keyword columns.
++     */
++    static Optional<String> lexicalBackstop(String sql) {
++        int n = sql.length();
++        int i = 0;
++        char prev = ' ';
++        while (i < n) {
++            char c = sql.charAt(i);
++            if (c == '\'') {
++                i++;
++                while (i < n) {
++                    if (sql.charAt(i) == '\'') {
++                        if (i + 1 < n && sql.charAt(i + 1) == '\'') {
++                            i += 2;
++                            continue;
++                        }
++                        break;
++                    }
++                    i++;
++                }
++                i++;
++                prev = '\'';
++                continue;
++            }
++            boolean quoted = c == '"';
++            if (quoted || Character.isLetter(c) || c == '_') {
++                int start = quoted ? i + 1 : i;
++                int j = start;
++                if (quoted) {
++                    while (j < n && sql.charAt(j) != '"') {
++                        j++;
++                    }
++                } else {
++                    while (j < n && (Character.isLetterOrDigit(sql.charAt(j)) || sql.charAt(j) == '_'
++                            || sql.charAt(j) == '$')) {
++                        j++;
++                    }
++                }
++                String name = sql.substring(start, j).toLowerCase(Locale.ROOT);
++                i = quoted ? j + 1 : j;
++                int k = i;
++                while (k < n && Character.isWhitespace(sql.charAt(k))) {
++                    k++;
++                }
++                boolean call = k < n && sql.charAt(k) == '(';
++                boolean qualified = prev == '.' || k < n && sql.charAt(k) == '.';
++                if (call && isBlockedFunction(name)) {
++                    return Optional.of("Hàm '" + name + "' bị cấm vì lý do an toàn.");
++                }
++                if (name.startsWith("pg_") || name.equals("information_schema")) {
++                    return Optional.of("Tên '" + name + "' thuộc catalog hệ thống, không được phép truy vấn.");
++                }
++                if (!quoted && !qualified && KEYWORD_COLUMNS.contains(name)) {
++                    return Optional.of("Từ khóa '" + name + "' tiết lộ thông tin phiên làm việc, không được phép.");
++                }
++                prev = 'a';
++                continue;
++            }
++            if (!Character.isWhitespace(c)) {
++                prev = c;
++            }
++            i++;
++        }
++        return Optional.empty();
++    }
++
+     private static boolean isAllowedTable(Table table) {
+         // Exactly schema.table; a database part (db.schema.table) or missing schema is rejected.
+         if (table.getDatabase() != null && table.getDatabase().getDatabaseName() != null) {
+             return false;
+         }
+-        String schema = unquote(table.getSchemaName());
+-        return schema != null && ALLOWED_SCHEMA.equalsIgnoreCase(schema);
++        return table.getSchemaName() != null && ALLOWED_SCHEMA.equals(fold(table.getSchemaName()));
+     }
+ 
+     private static void applyLimit(Select select) {
+-        Limit limit = select.getLimit();
++        // JSqlParser attaches a trailing "UNION ... LIMIT n" to the last (unparenthesized) branch; in
++        // Postgres that LIMIT applies to the whole set operation, so treat it as the outermost one.
++        Select holder = select;
++        if (select instanceof SetOperationList union && union.getLimit() == null
++                && union.getSelects() != null && !union.getSelects().isEmpty()) {
++            Select last = union.getSelects().get(union.getSelects().size() - 1);
++            if (last instanceof PlainSelect && last.getLimit() != null) {
++                holder = last;
++            }
++        }
++        Limit limit = holder.getLimit();
+         if (limit == null) {
+             limit = new Limit();
+             limit.setRowCount(new LongValue(MAX_ROWS));
+-            select.setLimit(limit);
++            holder.setLimit(limit);
+             return;
+         }
+         if (limit.getRowCount() instanceof LongValue rows && rows.getValue() <= MAX_ROWS) {
+             return;
+         }
+         // Too large, LIMIT ALL / NULL, or an expression we cannot prove is <= MAX_ROWS.
+         limit.setLimitAll(false);
+         limit.setLimitNull(false);
+         limit.setRowCount(new LongValue(MAX_ROWS));
+     }
+ 
++    /** Postgres folding: unquoted identifiers lowercase, quoted ones compare exactly. */
++    static String fold(String identifier) {
++        String n = identifier.strip();
++        if (n.length() >= 2 && n.startsWith("\"") && n.endsWith("\"")) {
++            return n.substring(1, n.length() - 1).replace("\"\"", "\"");
++        }
++        return n.toLowerCase(Locale.ROOT);
++    }
++
+     private static String unquote(String name) {
+         if (name == null) {
+             return null;
+         }
+         String n = name.strip();
+         if (n.length() >= 2 && (n.startsWith("\"") && n.endsWith("\"") || n.startsWith("`") && n.endsWith("`"))) {
+             n = n.substring(1, n.length() - 1);
+         }
+         return n;
+     }
+@@ -157,52 +264,74 @@ public class SqlGuard {
+      * Walks every node of the statement via the deparser visitors (which must visit every clause to
+      * print it), tracking Postgres CTE scoping: a non-recursive WITH item sees only earlier siblings,
+      * WITH RECURSIVE also sees itself, and CTEs of a nested SELECT do not leak outward.
+      */
+     private static final class Inspector {
+         final List<Table> tables = new ArrayList<>();
+         final List<String> functions = new ArrayList<>();
+         String nonSelectCte;
+         boolean hasInto;
+         boolean hasLocking;
+-        private final Deque<Set<String>> scopes = new ArrayDeque<>();
++        private final Deque<Scope> scopes = new ArrayDeque<>();
++
++        private static final class Scope {
++            final Set<String> names = new HashSet<>();
++            final boolean recursive;
++
++            Scope(boolean recursive) {
++                this.recursive = recursive;
++            }
++        }
++
++        /** WITH RECURSIVE written once applies to every item of that WITH clause. */
++        private void pushScope(Select select) {
++            boolean recursive = select.getWithItemsList() != null
++                    && select.getWithItemsList().stream().anyMatch(WithItem::isRecursive);
++            scopes.push(new Scope(recursive));
++        }
+ 
+         void walk(Select select) {
+             StringBuilder sink = new StringBuilder();
+             ScopedSelectDeParser selects = new ScopedSelectDeParser(sink);
+             expressions = new HookedExpressionDeParser(selects, sink);
+             selects.setExpressionVisitor(expressions);
+             select.accept((SelectVisitor<StringBuilder>) selects, null);
+         }
+ 
+         private boolean isVisibleCte(Table table) {
+             if (table.getSchemaName() != null || table.getName() == null) {
+                 return false;
+             }
+-            String n = unquote(table.getName()).toLowerCase(Locale.ROOT);
+-            return scopes.stream().anyMatch(frame -> frame.contains(n));
++            String n = fold(table.getName());
++            return scopes.stream().anyMatch(frame -> frame.names.contains(n));
+         }
+ 
+         private void record(String name) {
+             if (name == null) {
+                 return;
+             }
+             String n = name;
+             int dot = n.lastIndexOf('.');
+             if (dot >= 0) {
+                 n = n.substring(dot + 1);
+             }
+             functions.add(unquote(n).toLowerCase(Locale.ROOT));
+         }
+ 
+         private ExpressionDeParser expressions;
+ 
++        private void walkExpression(Object node) {
++            if (node instanceof Expression e) {
++                e.accept(expressions, null);
++            }
++        }
++
+         /** The deparser prints WINDOW clauses and frame bounds as text, so walk their expressions here. */
+         private void walkWindowElement(WindowElement element) {
+             if (element == null) {
+                 return;
+             }
+             for (WindowOffset offset : new WindowOffset[] {
+                     element.getOffset(),
+                     element.getRange() == null ? null : element.getRange().getStart(),
+                     element.getRange() == null ? null : element.getRange().getEnd()}) {
+                 if (offset != null && offset.getExpression() != null) {
+@@ -234,20 +363,75 @@ public class SqlGuard {
+             HookedExpressionDeParser(SelectVisitor<StringBuilder> selectVisitor, StringBuilder sb) {
+                 super(selectVisitor, sb);
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(Function function, S context) {
+                 record(function.getName());
+                 return super.visit(function, context);
+             }
+ 
++            @Override
++            public <S> StringBuilder visit(IsDistinctExpression expr, S context) {
++                walkExpression(expr.getLeftExpression());
++                walkExpression(expr.getRightExpression());
++                return super.visit(expr, context);
++            }
++
++            @Override
++            public <S> StringBuilder visit(JsonOperator expr, S context) {
++                walkExpression(expr.getLeftExpression());
++                walkExpression(expr.getRightExpression());
++                return super.visit(expr, context);
++            }
++
++            @Override
++            public <S> StringBuilder visit(JsonExpression expr, S context) {
++                walkExpression(expr.getExpression());
++                if (expr.getIdentList() != null) {
++                    for (java.util.Map.Entry<Expression, String> ident : expr.getIdentList()) {
++                        walkExpression(ident.getKey());
++                    }
++                }
++                return super.visit(expr, context);
++            }
++
++            @Override
++            public <S> StringBuilder visit(JsonFunction expr, S context) {
++                if (expr.getKeyValuePairs() != null) {
++                    for (JsonKeyValuePair pair : expr.getKeyValuePairs()) {
++                        walkExpression(pair.getKey());
++                        walkExpression(pair.getValue());
++                    }
++                }
++                if (expr.getExpressions() != null) {
++                    for (JsonFunctionExpression e : expr.getExpressions()) {
++                        walkExpression(e.getExpression());
++                    }
++                }
++                return super.visit(expr, context);
++            }
++
++            @Override
++            public <S> StringBuilder visit(JsonAggregateFunction expr, S context) {
++                walkExpression(expr.getExpression());
++                walkExpression(expr.getKey());
++                walkExpression(expr.getValue());
++                walkExpression(expr.getFilterExpression());
++                if (expr.getExpressionOrderByElements() != null) {
++                    for (OrderByElement order : expr.getExpressionOrderByElements()) {
++                        walkExpression(order.getExpression());
++                    }
++                }
++                return super.visit(expr, context);
++            }
++
+             @Override
+             public <S> StringBuilder visit(AnalyticExpression expr, S context) {
+                 record(expr.getName());
+                 walkWindowElement(expr.getWindowElement());
+                 return super.visit(expr, context);
+             }
+         }
+ 
+         private final class ScopedSelectDeParser extends SelectDeParser {
+             ScopedSelectDeParser(StringBuilder sb) {
+@@ -255,79 +439,94 @@ public class SqlGuard {
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(Table table, S context) {
+                 if (!isVisibleCte(table)) {
+                     tables.add(table);
+                 }
+                 return super.visit(table, context);
+             }
+ 
++            @Override
++            public <S> StringBuilder visit(ParenthesedFromItem item, S context) {
++                // The deparser prints the joins inside the parentheses as text; walk them here.
++                if (item.getJoins() != null) {
++                    for (Join join : item.getJoins()) {
++                        join.getRightItem().accept((FromItemVisitor<StringBuilder>) this, null);
++                        if (join.getOnExpressions() != null) {
++                            for (Expression on : join.getOnExpressions()) {
++                                on.accept(expressions, null);
++                            }
++                        }
++                    }
++                }
++                return super.visit(item, context);
++            }
++
+             @Override
+             public <S> StringBuilder visit(TableFunction tableFunction, S context) {
+                 if (tableFunction.getFunction() != null) {
+                     record(tableFunction.getFunction().getName());
+                 }
+                 return super.visit(tableFunction, context);
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(WithItem<?> withItem, S context) {
+                 if (!(withItem.getParenthesedStatement() instanceof ParenthesedSelect)) {
+                     nonSelectCte = withItem.getUnquotedAliasName();
+                 }
+-                String alias = withItem.getUnquotedAliasName() == null ? null
+-                        : withItem.getUnquotedAliasName().toLowerCase(Locale.ROOT);
+-                Set<String> frame = scopes.peek();
+-                if (withItem.isRecursive() && alias != null && frame != null) {
+-                    frame.add(alias);
++                String alias = withItem.getAliasName() == null ? null : fold(withItem.getAliasName());
++                Scope frame = scopes.peek();
++                if (frame != null && frame.recursive && alias != null) {
++                    frame.names.add(alias);
+                 }
+                 StringBuilder result = super.visit(withItem, context);
+                 if (alias != null && frame != null) {
+-                    frame.add(alias);
++                    frame.names.add(alias);
+                 }
+                 return result;
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(PlainSelect plainSelect, S context) {
+                 if (plainSelect.getIntoTables() != null && !plainSelect.getIntoTables().isEmpty()
+                         || plainSelect.getIntoTempTable() != null) {
+                     hasInto = true;
+                 }
+                 if (plainSelect.getForMode() != null || plainSelect.getForUpdateTable() != null) {
+                     hasLocking = true;
+                 }
+-                scopes.push(new HashSet<>());
++                pushScope(plainSelect);
+                 try {
+                     walkWindowDefinitions(plainSelect.getWindowDefinitions());
+                     return super.visit(plainSelect, context);
+                 } finally {
+                     scopes.pop();
+                 }
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(SetOperationList list, S context) {
+                 if (list.getForMode() != null || list.getForUpdateTable() != null) {
+                     hasLocking = true;
+                 }
+-                scopes.push(new HashSet<>());
++                pushScope(list);
+                 try {
+                     return super.visit(list, context);
+                 } finally {
+                     scopes.pop();
+                 }
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(ParenthesedSelect select, S context) {
+-                scopes.push(new HashSet<>());
++                pushScope(select);
+                 try {
+                     return super.visit(select, context);
+                 } finally {
+                     scopes.pop();
+                 }
+             }
+         }
+     }
+ }
+diff --git a/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java b/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
+index 4cb1951..8cf6642 100644
+--- a/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
++++ b/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
+@@ -119,20 +119,116 @@ class SqlGuardTest {
+                 "WITH a AS (SELECT 1 AS x FROM dw.dim_date), b AS (SELECT * FROM a) SELECT * FROM b",
+                 "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT * FROM r",
+                 "SELECT * FROM dw.dim_date ORDER BY (SELECT max(date_key) FROM dw.fact_sales)"
+         };
+         for (String q : queries) {
+             GuardResult r = guard.check(q);
+             assertThat(r.allowed()).as("%s -> %s", q, r.reason()).isTrue();
+         }
+     }
+ 
++    @ParameterizedTest
++    @ValueSource(strings = {
++            // 1. quoted identifiers are case-sensitive in Postgres
++            "WITH \"PG_USER\" AS (SELECT 1) SELECT * FROM pg_user",
++            "WITH \"Users\" AS (SELECT 1) SELECT * FROM users",
++            "SELECT * FROM \"DW\".dim_date",
++            // 2. joins inside a parenthesized FROM item
++            "SELECT * FROM (dw.dim_date d JOIN pg_shadow s ON true)",
++            "SELECT * FROM (dw.dim_date b CROSS JOIN pg_user)",
++            "SELECT * FROM dw.dim_date a JOIN (dw.dim_date b JOIN dw.dim_date c "
++                    + "ON current_setting('x')='1') ON true",
++            "SELECT * FROM (dw.dim_date d JOIN dw.dim_date e ON pg_sleep(1) IS NULL)",
++            "SELECT * FROM (dw.dim_date d JOIN app.users u ON true)",
++            // 3. IS [NOT] DISTINCT FROM
++            "SELECT * FROM dw.dim_date x WHERE x.date_key IS DISTINCT FROM (SELECT 1 FROM app.users)",
++            "SELECT * FROM dw.dim_date x WHERE x.date_key IS NOT DISTINCT FROM (SELECT 1 FROM app.users)",
++            "SELECT * FROM dw.dim_date x WHERE (SELECT 1 FROM app.users) IS DISTINCT FROM x.date_key",
++            "SELECT * FROM dw.dim_date x WHERE x.date_key IS DISTINCT FROM pg_sleep(1)",
++            // 4. SQL/JSON constructors
++            "SELECT JSON_ARRAYAGG((SELECT username FROM app.users LIMIT 1)) FROM dw.dim_date",
++            "SELECT JSON_ARRAY((SELECT username FROM app.users LIMIT 1)) FROM dw.dim_date",
++            "SELECT JSON_OBJECT('k' : (SELECT username FROM app.users LIMIT 1)) FROM dw.dim_date",
++            "SELECT JSON_OBJECTAGG(date_key VALUE (SELECT username FROM app.users LIMIT 1)) FROM dw.dim_date",
++            "SELECT JSON_OBJECT('k' VALUE pg_sleep(1)) FROM dw.dim_date",
++            // 5. JSON operators
++            "SELECT d.j -> (SELECT username FROM app.users LIMIT 1) FROM dw.dim_date d",
++            "SELECT d.j ->> pg_sleep(1)::text FROM dw.dim_date d",
++            "SELECT (SELECT '{}'::jsonb FROM app.users LIMIT 1) ->> 'a' FROM dw.dim_date d",
++            "SELECT d.j #>> (SELECT '{a}' FROM app.users LIMIT 1) FROM dw.dim_date d",
++            // 6. keyword forms parsed as columns
++            "SELECT current_user",
++            "SELECT session_user",
++            "SELECT user",
++            "SELECT current_role",
++            "SELECT current_schema",
++            "SELECT current_catalog",
++            "SELECT date_key, current_user FROM dw.dim_date",
++            // 7. functions running SQL text
++            "SELECT * FROM ts_stat('SELECT 1')",
++            "SELECT ts_rewrite('a'::tsquery, 'SELECT 1')"
++    })
++    void blocksRound2Bypasses(String sql) {
++        GuardResult r = guard.check(sql);
++        assertThat(r.allowed()).as(sql).isFalse();
++        assertThat(r.reason()).isNotBlank();
++    }
++
++    @Test
++    void allowsRecursiveAppliedToEveryWithItem() {
++        GuardResult r = guard.check("WITH RECURSIVE r AS (SELECT 1 n), "
++                + "s AS (SELECT n+1 FROM s WHERE n<3 UNION ALL SELECT n FROM r) SELECT * FROM s");
++        assertThat(r.allowed()).as(r.reason()).isTrue();
++    }
++
++    @Test
++    void quotedCteMatchesQuotedReferenceExactly() {
++        GuardResult r = guard.check("WITH \"Mixed\" AS (SELECT 1 AS n FROM dw.dim_date) SELECT * FROM \"Mixed\"");
++        assertThat(r.allowed()).as(r.reason()).isTrue();
++    }
++
++    @Test
++    void unionTrailingLimitIsKeptOrCappedAndSingle() {
++        GuardResult small = guard.check("SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales LIMIT 10");
++        assertThat(small.allowed()).as(small.reason()).isTrue();
++        assertThat(small.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 10");
++
++        GuardResult big = guard.check(
++                "SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales LIMIT 99999 OFFSET 5");
++        assertThat(big.allowed()).as(big.reason()).isTrue();
++        assertThat(big.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 1000").contains("OFFSET 5");
++
++        GuardResult none = guard.check("SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales");
++        assertThat(none.safeSql()).containsOnlyOnce("LIMIT").endsWith("LIMIT 1000");
++    }
++
++    @Test
++    void lexicalBackstopCatchesWhatTheAstWalkCouldMiss() {
++        assertThat(SqlGuard.lexicalBackstop("SELECT pg_sleep (1)")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT \"query_to_xml\"('x')")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT * FROM pg_user")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT * FROM information_schema.tables")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT current_user")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT CURRENT_SCHEMA")).isPresent();
++        // literals and unrelated identifiers are fine
++        assertThat(SqlGuard.lexicalBackstop("SELECT 'pg_sleep(1) current_user' FROM dw.dim_date")).isEmpty();
++        assertThat(SqlGuard.lexicalBackstop("SELECT d.user_name, sum(x) FROM dw.dim_date d")).isEmpty();
++        assertThat(SqlGuard.lexicalBackstop("SELECT 'it''s pg_sleep(1)', px FROM dw.dim_date")).isEmpty();
++    }
++
++    @Test
++    void blockedFunctionPredicateIsPublicAndCoversFamilies() {
++        assertThat(SqlGuard.isBlockedFunction("pg_sleep")).isTrue();
++        assertThat(SqlGuard.isBlockedFunction("ts_stat")).isTrue();
++        assertThat(SqlGuard.isBlockedFunction("sum")).isFalse();
++    }
++
+     @Test
+     void reasonNamesOffendingTableAndFunction() {
+         assertThat(guard.check("SELECT * FROM app.users").reason()).contains("app.users");
+         assertThat(guard.check("SELECT * FROM fact_sales").reason()).contains("fact_sales");
+         assertThat(guard.check("SELECT PG_SLEEP(1)").reason()).contains("pg_sleep");
+     }
+ 
+     @Test
+     void addsLimitWhenMissing() {
+         GuardResult r = guard.check("SELECT count(*) FROM dw.fact_sales");

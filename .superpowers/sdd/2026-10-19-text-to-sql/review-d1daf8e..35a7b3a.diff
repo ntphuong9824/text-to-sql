@@ -1,0 +1,180 @@
+# Review package: d1daf8e..HEAD
+
+## Commits
+35a7b3a fix(llm): use JDK HTTP client with real timeouts; add real-server and context tests
+
+## Files changed
+ .../java/com/fsoft/training/llm/LlmConfig.java     | 14 ++--
+ .../com/fsoft/training/llm/LlmClientHttpTest.java  | 84 ++++++++++++++++++++++
+ .../com/fsoft/training/llm/LlmContextTest.java     | 34 +++++++++
+ 3 files changed, 127 insertions(+), 5 deletions(-)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/llm/LlmConfig.java b/src/main/java/com/fsoft/training/llm/LlmConfig.java
+index 9b4795a..1d00662 100644
+--- a/src/main/java/com/fsoft/training/llm/LlmConfig.java
++++ b/src/main/java/com/fsoft/training/llm/LlmConfig.java
+@@ -1,24 +1,28 @@
+ package com.fsoft.training.llm;
+ 
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+-import org.springframework.http.client.SimpleClientHttpRequestFactory;
++import java.net.http.HttpClient;
++import org.springframework.http.client.JdkClientHttpRequestFactory;
+ import org.springframework.web.client.RestClient;
+ 
+ @Configuration(proxyBeanMethods = false)
+ class LlmConfig {
+ 
+     @Bean
+     Sleeper llmSleeper() {
+         return duration -> Thread.sleep(duration.toMillis());
+     }
+ 
+     @Bean
+     LlmClient llmClient(RestClient.Builder builder, LlmProperties properties, Sleeper sleeper) {
+-        var factory = new SimpleClientHttpRequestFactory();
+-        factory.setConnectTimeout(properties.timeout());
++        return create(builder, properties, sleeper);
++    }
++
++    static OpenAiCompatibleLlmClient create(RestClient.Builder builder, LlmProperties properties, Sleeper sleeper) {
++        HttpClient httpClient = HttpClient.newBuilder().connectTimeout(properties.timeout()).build();
++        var factory = new JdkClientHttpRequestFactory(httpClient);
+         factory.setReadTimeout(properties.timeout());
+-        RestClient.Builder configured = builder.clone().requestFactory(factory);
+-        return new OpenAiCompatibleLlmClient(configured, properties, sleeper);
++        return new OpenAiCompatibleLlmClient(builder.clone().requestFactory(factory), properties, sleeper);
+     }
+ }
+diff --git a/src/test/java/com/fsoft/training/llm/LlmClientHttpTest.java b/src/test/java/com/fsoft/training/llm/LlmClientHttpTest.java
+new file mode 100644
+index 0000000..0df48f3
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/llm/LlmClientHttpTest.java
+@@ -0,0 +1,84 @@
++package com.fsoft.training.llm;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.sun.net.httpserver.HttpServer;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.List;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.client.RestClient;
++
++/** Exercises the production HTTP stack (LlmConfig factory) against a real local server. */
++class LlmClientHttpTest {
++
++    private HttpServer server;
++
++    @BeforeEach
++    void start() throws Exception {
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.start();
++    }
++
++    @AfterEach
++    void stop() {
++        server.stop(0);
++    }
++
++    private OpenAiCompatibleLlmClient client(Duration timeout) {
++        String base = "http://127.0.0.1:" + server.getAddress().getPort() + "/v1/";
++        return LlmConfig.create(RestClient.builder(),
++                new LlmProperties(base, "secret-key", "m", timeout, 0, 0), d -> { });
++    }
++
++    private static List<ChatMessage> msgs() {
++        return List.of(ChatMessage.user("hi"));
++    }
++
++    @Test
++    void unauthorizedWithWwwAuthenticateGivesBadKeyMessage() {
++        server.createContext("/v1/chat/completions", ex -> {
++            ex.getRequestBody().readAllBytes();
++            ex.getResponseHeaders().add("WWW-Authenticate", "Bearer");
++            ex.sendResponseHeaders(401, -1);
++            ex.close();
++        });
++        assertThatThrownBy(() -> client(Duration.ofSeconds(5)).complete(msgs()))
++                .isInstanceOf(LlmException.class)
++                .satisfies(e -> assertThat(((LlmException) e).userMessage()).contains("API key"));
++    }
++
++    @Test
++    void okReturnsContent() {
++        server.createContext("/v1/chat/completions", ex -> {
++            ex.getRequestBody().readAllBytes();
++            byte[] body = "{\"choices\":[{\"message\":{\"content\":\"SELECT 1\"}}]}".getBytes(StandardCharsets.UTF_8);
++            ex.getResponseHeaders().add("Content-Type", "application/json");
++            ex.sendResponseHeaders(200, body.length);
++            ex.getResponseBody().write(body);
++            ex.close();
++        });
++        assertThat(client(Duration.ofSeconds(5)).complete(msgs())).isEqualTo("SELECT 1");
++    }
++
++    @Test
++    void slowServerTimesOut() {
++        server.createContext("/v1/chat/completions", ex -> {
++            ex.getRequestBody().readAllBytes();
++            try {
++                Thread.sleep(2000);
++            }
++            catch (InterruptedException ignored) {
++                Thread.currentThread().interrupt();
++            }
++            ex.close();
++        });
++        assertThatThrownBy(() -> client(Duration.ofMillis(200)).complete(msgs()))
++                .isInstanceOf(LlmException.class)
++                .satisfies(e -> assertThat(((LlmException) e).userMessage()).isEqualTo("Dịch vụ AI không phản hồi"));
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/llm/LlmContextTest.java b/src/test/java/com/fsoft/training/llm/LlmContextTest.java
+new file mode 100644
+index 0000000..7a788e2
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/llm/LlmContextTest.java
+@@ -0,0 +1,34 @@
++package com.fsoft.training.llm;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import org.junit.jupiter.api.Test;
++import org.springframework.boot.context.properties.EnableConfigurationProperties;
++import org.springframework.boot.test.context.runner.ApplicationContextRunner;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.web.client.RestClient;
++
++class LlmContextTest {
++
++    @Configuration(proxyBeanMethods = false)
++    @EnableConfigurationProperties(LlmProperties.class)
++    static class Props {
++        @Bean
++        RestClient.Builder restClientBuilder() {
++            return RestClient.builder();
++        }
++    }
++
++    @Test
++    void realClientBeanLoadsWithoutApiKey() {
++        new ApplicationContextRunner()
++                .withUserConfiguration(Props.class, LlmConfig.class)
++                .withPropertyValues("llm.base-url=https://example.test/v1/", "llm.api-key=", "llm.model=m",
++                        "llm.timeout=30s", "llm.max-retries=3", "llm.temperature=0")
++                .run(ctx -> {
++                    assertThat(ctx).hasNotFailed();
++                    assertThat(ctx.getBean(LlmClient.class)).isInstanceOf(OpenAiCompatibleLlmClient.class);
++                });
++    }
++}

@@ -1,0 +1,198 @@
+examples:
+  - question: "Tổng doanh thu mỗi khu vực trong năm 2024"
+    sql: |
+      SELECT c.region AS region, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year = 2024
+      GROUP BY c.region
+      ORDER BY revenue DESC
+  - question: "Revenue of Europe region across all years"
+    sql: |
+      SELECT c.region AS region, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      WHERE c.region = 'Europe'
+      GROUP BY c.region
+  - question: "Doanh thu Bắc Mỹ so với Châu Âu"
+    sql: |
+      SELECT c.region AS region, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      WHERE c.region IN ('North America', 'Europe')
+      GROUP BY c.region
+      ORDER BY revenue DESC
+  - question: "Doanh thu từng tháng trong năm 2023"
+    sql: |
+      SELECT d.month AS month, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year = 2023
+      GROUP BY d.month
+      ORDER BY d.month
+  - question: "Monthly sales trend for 2022"
+    sql: |
+      SELECT d.month AS month, d.month_name AS month_name, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year = 2022
+      GROUP BY d.month, d.month_name
+      ORDER BY d.month
+  - question: "Doanh thu qua các năm"
+    sql: |
+      SELECT d.year AS year, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      GROUP BY d.year
+      ORDER BY d.year
+  - question: "Total revenue by quarter in 2025"
+    sql: |
+      SELECT d.quarter AS quarter, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year = 2025
+      GROUP BY d.quarter
+      ORDER BY d.quarter
+  - question: "Tổng doanh thu toàn bộ"
+    sql: |
+      SELECT SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+  - question: "Top 5 nghệ sĩ có doanh thu cao nhất"
+    sql: |
+      SELECT t.artist_name AS artist_name, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_track t ON t.track_key = f.track_key
+      GROUP BY t.artist_name
+      ORDER BY revenue DESC, t.artist_name
+      LIMIT 5
+  - question: "Top 10 best selling tracks"
+    sql: |
+      SELECT t.track_name AS track_name, t.artist_name AS artist_name, SUM(f.quantity) AS units_sold, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_track t ON t.track_key = f.track_key
+      GROUP BY t.track_key, t.track_name, t.artist_name
+      ORDER BY revenue DESC, units_sold DESC, t.track_name, t.track_key
+      LIMIT 10
+  - question: "Thể loại nhạc nào bán chạy nhất năm 2023?"
+    sql: |
+      SELECT t.genre_name AS genre_name, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_track t ON t.track_key = f.track_key
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year = 2023
+      GROUP BY t.genre_name
+      ORDER BY revenue DESC, t.genre_name
+      LIMIT 1
+  - question: "Doanh thu theo thể loại"
+    sql: |
+      SELECT t.genre_name AS genre_name, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_track t ON t.track_key = f.track_key
+      GROUP BY t.genre_name
+      ORDER BY revenue DESC
+  - question: "Số đơn hàng của mỗi quốc gia"
+    sql: |
+      SELECT c.country AS country, COUNT(DISTINCT f.invoice_id) AS order_count
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      GROUP BY c.country
+      ORDER BY order_count DESC
+  - question: "Number of orders per country in 2024"
+    sql: |
+      SELECT c.country AS country, COUNT(DISTINCT f.invoice_id) AS order_count
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year = 2024
+      GROUP BY c.country
+      ORDER BY order_count DESC
+  - question: "Nhân viên nào bán tốt nhất?"
+    sql: |
+      SELECT e.full_name AS employee_name, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_employee e ON e.employee_key = f.employee_key
+      GROUP BY e.employee_key, e.full_name
+      ORDER BY revenue DESC, e.full_name
+      LIMIT 1
+  - question: "Doanh thu của từng nhân viên trong năm 2022"
+    sql: |
+      SELECT e.full_name AS employee_name, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_employee e ON e.employee_key = f.employee_key
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year = 2022
+      GROUP BY e.employee_key, e.full_name
+      ORDER BY revenue DESC, e.full_name
+  - question: "So sánh doanh thu năm 2023 và 2024"
+    sql: |
+      SELECT d.year AS year, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year IN (2023, 2024)
+      GROUP BY d.year
+      ORDER BY d.year
+  - question: "Compare 2021 and 2025 revenue by region"
+    sql: |
+      SELECT c.region AS region, d.year AS year, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE d.year IN (2021, 2025)
+      GROUP BY c.region, d.year
+      ORDER BY c.region, d.year
+  - question: "Khách hàng chi tiêu nhiều nhất"
+    sql: |
+      SELECT c.full_name AS customer_name, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      GROUP BY c.customer_key, c.full_name
+      ORDER BY revenue DESC, c.full_name
+      LIMIT 1
+  - question: "Top 5 customers by total spending"
+    sql: |
+      SELECT c.full_name AS customer_name, c.country AS country, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      GROUP BY c.customer_key, c.full_name, c.country
+      ORDER BY revenue DESC, c.full_name
+      LIMIT 5
+  - question: "Thời lượng trung bình của bài hát theo thể loại"
+    sql: |
+      SELECT t.genre_name AS genre_name, ROUND(AVG(t.milliseconds) / 60000.0, 2) AS avg_minutes
+      FROM dw.dim_track t
+      GROUP BY t.genre_name
+      ORDER BY avg_minutes DESC
+  - question: "Số lượng khách hàng mỗi khu vực"
+    sql: |
+      SELECT c.region AS region, COUNT(DISTINCT f.customer_key) AS customer_count
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      GROUP BY c.region
+      ORDER BY customer_count DESC
+  - question: "Which cities in Asia-Pacific generate the most revenue?"
+    sql: |
+      SELECT c.city AS city, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      WHERE c.region = 'Asia-Pacific'
+      GROUP BY c.city
+      ORDER BY revenue DESC, c.city
+      LIMIT 10
+  - question: "Doanh thu Rock theo từng năm"
+    sql: |
+      SELECT d.year AS year, SUM(f.revenue) AS revenue
+      FROM dw.fact_sales f
+      JOIN dw.dim_track t ON t.track_key = f.track_key
+      JOIN dw.dim_date d ON d.date_key = f.date_key
+      WHERE t.genre_name = 'Rock'
+      GROUP BY d.year
+      ORDER BY d.year
+  - question: "Giá trị trung bình mỗi đơn hàng của từng quốc gia"
+    sql: |
+      SELECT c.country AS country,
+             ROUND(SUM(f.revenue) / COUNT(DISTINCT f.invoice_id), 2) AS avg_order_value
+      FROM dw.fact_sales f
+      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
+      GROUP BY c.country
+      ORDER BY avg_order_value DESC

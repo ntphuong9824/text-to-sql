@@ -1,0 +1,11 @@
+# Task 11 report
+Implemented conversation package (ConversationRepository, MessageRepository, ConversationService, ChatController, ConversationController, ConversationDtos, ConversationNotFoundException) plus a 404 handler in ApiExceptionHandler ("Không tìm thấy hội thoại"). Pipeline runs outside any transaction; message insert + updated_at touch run in one TransactionTemplate. JSONB written with cast(:x as jsonb) from JsonMapper strings, read via ::text.
+Tests: ChatApiTest, 10 tests (new conversation/BAR/ISO createdAt, title truncation, follow-up with SQL in rewrite request + JSONB restore + no extra LLM calls, list order/own-only, identical 404 for foreign/missing + survival, BLOCKED stored, LlmException -> ERROR 200, error turns excluded from history, 400s for empty/501, delete cascade). Full `./mvnw test`: 279 run, 0 failures, BUILD SUCCESS.
+Caveat: the previous session was interrupted, so tests were written right after the implementation; no separate RED run was captured.
+
+## Fix round 1
+1. Malformed UUID path variable: MethodArgumentTypeMismatchException handler -> 404 "Không tìm thấy hội thoại" (DEBUG log). Test malformedConversationIdIs404.
+2. JSONB fidelity: MessageRepository mapper enables USE_BIG_DECIMAL_FOR_FLOATS. Test historyReplaysExactlyWhatTheLiveTurnReturned (null cell, ROUND(..,2), 100.00; node and raw-text equality live vs history). Note: that test passed in the RED run too (it was strengthened with a raw-text check afterwards, not re-run against old code). truncated=true cannot be reached through the pipeline because SqlGuard caps LIMIT at the executor limit, so only truncated=false round-trip is asserted.
+3. turn_index race: persistence tx now does SELECT 1 ... FOR UPDATE (ConversationRepository.lockOwned) -> ConversationNotFoundException if gone, then count, INSERT ... RETURNING created_at, DTO built from the insert (no re-read). Added V2__messages_turn_unique.sql. Tests: conversationDeletedWhilePipelineRunsIs404 (new FakeLlmClient.onComplete hook), duplicateTurnIndexIsRejectedByDatabase.
+RED: `./mvnw test -Dtest=ChatApiTest` -> 15 run, 4 failures (deleted-mid-pipeline 500, malformed id 500, duplicate turn_index accepted, truncated test later dropped).
+GREEN: `./mvnw clean test` -> 283 run, 0 failures. (A stale IDE-compiled target/ gave "Unresolved compilation problem" until `clean`.)

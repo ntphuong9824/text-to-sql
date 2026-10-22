@@ -1,0 +1,460 @@
+# Review package: 35a7b3a..HEAD
+
+## Commits
+0d2d376 feat(nl2sql): add few-shot examples and similarity selector
+
+## Files changed
+ .../com/fsoft/training/nl2sql/FewShotExample.java  |   3 +
+ .../com/fsoft/training/nl2sql/FewShotSelector.java |  78 ++++++++
+ .../com/fsoft/training/nl2sql/TextNormalizer.java  |  45 +++++
+ src/main/resources/fewshot/examples.yaml           | 198 +++++++++++++++++++++
+ .../training/nl2sql/FewShotExamplesValidTest.java  |  35 ++++
+ .../fsoft/training/nl2sql/FewShotSelectorTest.java |  50 ++++++
+ 6 files changed, 409 insertions(+)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/nl2sql/FewShotExample.java b/src/main/java/com/fsoft/training/nl2sql/FewShotExample.java
+new file mode 100644
+index 0000000..4cb28c0
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/nl2sql/FewShotExample.java
+@@ -0,0 +1,3 @@
++package com.fsoft.training.nl2sql;
++
++public record FewShotExample(String question, String sql) {}
+diff --git a/src/main/java/com/fsoft/training/nl2sql/FewShotSelector.java b/src/main/java/com/fsoft/training/nl2sql/FewShotSelector.java
+new file mode 100644
+index 0000000..fccbc14
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/nl2sql/FewShotSelector.java
+@@ -0,0 +1,78 @@
++package com.fsoft.training.nl2sql;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.UncheckedIOException;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import org.springframework.core.io.ClassPathResource;
++import org.springframework.stereotype.Component;
++import tools.jackson.dataformat.yaml.YAMLMapper;
++
++@Component
++public class FewShotSelector {
++
++    private static final String RESOURCE = "fewshot/examples.yaml";
++
++    record Document(List<FewShotExample> examples) {}
++
++    private record Indexed(FewShotExample example, Set<String> tokens) {}
++
++    private volatile List<Indexed> cached;
++
++    public List<FewShotExample> all() {
++        return index().stream().map(Indexed::example).toList();
++    }
++
++    /** Exactly min(k, all().size()) examples, best Jaccard score first, file order on ties. */
++    public List<FewShotExample> select(String question, int k) {
++        Set<String> query = TextNormalizer.tokens(question);
++        List<Indexed> indexed = index();
++        double[] scores = new double[indexed.size()];
++        List<Integer> order = new ArrayList<>();
++        for (int i = 0; i < indexed.size(); i++) {
++            scores[i] = jaccard(query, indexed.get(i).tokens());
++            order.add(i);
++        }
++        // List.sort is stable, so equal scores keep file order.
++        order.sort((a, b) -> Double.compare(scores[b], scores[a]));
++        return order.stream().limit(Math.max(0, k)).map(i -> indexed.get(i).example()).toList();
++    }
++
++    private static double jaccard(Set<String> a, Set<String> b) {
++        if (a.isEmpty() || b.isEmpty()) {
++            return 0;
++        }
++        Set<String> inter = new HashSet<>(a);
++        inter.retainAll(b);
++        int union = a.size() + b.size() - inter.size();
++        return (double) inter.size() / union;
++    }
++
++    private List<Indexed> index() {
++        List<Indexed> local = cached;
++        if (local == null) {
++            synchronized (this) {
++                local = cached;
++                if (local == null) {
++                    local = read();
++                    cached = local;
++                }
++            }
++        }
++        return local;
++    }
++
++    private List<Indexed> read() {
++        try (InputStream in = new ClassPathResource(RESOURCE).getInputStream()) {
++            Document doc = YAMLMapper.builder().build().readValue(in, Document.class);
++            return doc.examples().stream()
++                    .map(e -> new Indexed(e, TextNormalizer.tokens(e.question())))
++                    .toList();
++        } catch (IOException e) {
++            throw new UncheckedIOException("Cannot read " + RESOURCE, e);
++        }
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/nl2sql/TextNormalizer.java b/src/main/java/com/fsoft/training/nl2sql/TextNormalizer.java
+new file mode 100644
+index 0000000..716b7fd
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/nl2sql/TextNormalizer.java
+@@ -0,0 +1,45 @@
++package com.fsoft.training.nl2sql;
++
++import java.text.Normalizer;
++import java.util.Arrays;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++
++public final class TextNormalizer {
++
++    private static final Set<String> STOPWORDS = Set.of(
++            "la", "cua", "the", "of", "cho", "theo", "va", "and", "in", "by", "a", "an", "to",
++            "trong", "voi", "cac", "nhung", "mot", "is", "are", "what", "me", "toi");
++
++    private TextNormalizer() {}
++
++    /** Lowercase, strip Vietnamese diacritics (d with stroke becomes d), drop punctuation, collapse spaces. */
++    public static String normalize(String text) {
++        if (text == null) {
++            return "";
++        }
++        String s = text.toLowerCase(Locale.ROOT).replace('đ', 'd');
++        s = Normalizer.normalize(s, Normalizer.Form.NFD).replaceAll("\\p{M}+", "");
++        s = s.replaceAll("[^\\p{L}\\p{N}\\s]", " ");
++        return s.replaceAll("\\s+", " ").strip();
++    }
++
++    /** Unigrams without stopwords plus bigrams of adjacent remaining words (prefixed with "_"). */
++    public static Set<String> tokens(String text) {
++        String normalized = normalize(text);
++        Set<String> result = new LinkedHashSet<>();
++        if (normalized.isEmpty()) {
++            return result;
++        }
++        List<String> words = Arrays.stream(normalized.split(" "))
++                .filter(w -> !STOPWORDS.contains(w))
++                .toList();
++        result.addAll(words);
++        for (int i = 0; i + 1 < words.size(); i++) {
++            result.add("_" + words.get(i) + " " + words.get(i + 1));
++        }
++        return result;
++    }
++}
+diff --git a/src/main/resources/fewshot/examples.yaml b/src/main/resources/fewshot/examples.yaml
+new file mode 100644
+index 0000000..d3f7823
+--- /dev/null
++++ b/src/main/resources/fewshot/examples.yaml
+@@ -0,0 +1,198 @@
++examples:
++  - question: "Tổng doanh thu mỗi khu vực trong năm 2024"
++    sql: |
++      SELECT c.region AS region, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year = 2024
++      GROUP BY c.region
++      ORDER BY revenue DESC
++  - question: "Revenue of Europe region across all years"
++    sql: |
++      SELECT c.region AS region, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      WHERE c.region = 'Europe'
++      GROUP BY c.region
++  - question: "Doanh thu Bắc Mỹ so với Châu Âu"
++    sql: |
++      SELECT c.region AS region, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      WHERE c.region IN ('North America', 'Europe')
++      GROUP BY c.region
++      ORDER BY revenue DESC
++  - question: "Doanh thu từng tháng trong năm 2023"
++    sql: |
++      SELECT d.month AS month, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year = 2023
++      GROUP BY d.month
++      ORDER BY d.month
++  - question: "Monthly sales trend for 2022"
++    sql: |
++      SELECT d.month AS month, d.month_name AS month_name, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year = 2022
++      GROUP BY d.month, d.month_name
++      ORDER BY d.month
++  - question: "Doanh thu qua các năm"
++    sql: |
++      SELECT d.year AS year, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      GROUP BY d.year
++      ORDER BY d.year
++  - question: "Total revenue by quarter in 2025"
++    sql: |
++      SELECT d.quarter AS quarter, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year = 2025
++      GROUP BY d.quarter
++      ORDER BY d.quarter
++  - question: "Tổng doanh thu toàn bộ"
++    sql: |
++      SELECT SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++  - question: "Top 5 nghệ sĩ có doanh thu cao nhất"
++    sql: |
++      SELECT t.artist_name AS artist_name, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_track t ON t.track_key = f.track_key
++      GROUP BY t.artist_name
++      ORDER BY revenue DESC
++      LIMIT 5
++  - question: "Top 10 best selling tracks"
++    sql: |
++      SELECT t.track_name AS track_name, SUM(f.quantity) AS units_sold, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_track t ON t.track_key = f.track_key
++      GROUP BY t.track_name
++      ORDER BY revenue DESC, units_sold DESC
++      LIMIT 10
++  - question: "Thể loại nhạc nào bán chạy nhất năm 2023?"
++    sql: |
++      SELECT t.genre_name AS genre_name, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_track t ON t.track_key = f.track_key
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year = 2023
++      GROUP BY t.genre_name
++      ORDER BY revenue DESC
++      LIMIT 1
++  - question: "Doanh thu theo thể loại"
++    sql: |
++      SELECT t.genre_name AS genre_name, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_track t ON t.track_key = f.track_key
++      GROUP BY t.genre_name
++      ORDER BY revenue DESC
++  - question: "Số đơn hàng của mỗi quốc gia"
++    sql: |
++      SELECT c.country AS country, COUNT(DISTINCT f.invoice_id) AS order_count
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      GROUP BY c.country
++      ORDER BY order_count DESC
++  - question: "Number of orders per country in 2024"
++    sql: |
++      SELECT c.country AS country, COUNT(DISTINCT f.invoice_id) AS order_count
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year = 2024
++      GROUP BY c.country
++      ORDER BY order_count DESC
++  - question: "Nhân viên nào bán tốt nhất?"
++    sql: |
++      SELECT e.full_name AS employee_name, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_employee e ON e.employee_key = f.employee_key
++      GROUP BY e.full_name
++      ORDER BY revenue DESC
++      LIMIT 1
++  - question: "Doanh thu của từng nhân viên trong năm 2022"
++    sql: |
++      SELECT e.full_name AS employee_name, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_employee e ON e.employee_key = f.employee_key
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year = 2022
++      GROUP BY e.full_name
++      ORDER BY revenue DESC
++  - question: "So sánh doanh thu năm 2023 và 2024"
++    sql: |
++      SELECT d.year AS year, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year IN (2023, 2024)
++      GROUP BY d.year
++      ORDER BY d.year
++  - question: "Compare 2021 and 2025 revenue by region"
++    sql: |
++      SELECT c.region AS region, d.year AS year, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE d.year IN (2021, 2025)
++      GROUP BY c.region, d.year
++      ORDER BY c.region, d.year
++  - question: "Khách hàng mua nhiều nhất"
++    sql: |
++      SELECT c.full_name AS customer_name, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      GROUP BY c.customer_key, c.full_name
++      ORDER BY revenue DESC
++      LIMIT 1
++  - question: "Top 5 customers by total spending"
++    sql: |
++      SELECT c.full_name AS customer_name, c.country AS country, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      GROUP BY c.customer_key, c.full_name, c.country
++      ORDER BY revenue DESC
++      LIMIT 5
++  - question: "Thời lượng trung bình của bài hát theo thể loại"
++    sql: |
++      SELECT t.genre_name AS genre_name, ROUND(AVG(t.milliseconds) / 60000.0, 2) AS avg_minutes
++      FROM dw.dim_track t
++      GROUP BY t.genre_name
++      ORDER BY avg_minutes DESC
++  - question: "Số lượng khách hàng mỗi khu vực"
++    sql: |
++      SELECT c.region AS region, COUNT(DISTINCT f.customer_key) AS customer_count
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      GROUP BY c.region
++      ORDER BY customer_count DESC
++  - question: "Which cities in Asia-Pacific generate the most revenue?"
++    sql: |
++      SELECT c.city AS city, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      WHERE c.region = 'Asia-Pacific'
++      GROUP BY c.city
++      ORDER BY revenue DESC
++      LIMIT 10
++  - question: "Doanh thu Rock theo từng năm"
++    sql: |
++      SELECT d.year AS year, SUM(f.revenue) AS revenue
++      FROM dw.fact_sales f
++      JOIN dw.dim_track t ON t.track_key = f.track_key
++      JOIN dw.dim_date d ON d.date_key = f.date_key
++      WHERE t.genre_name = 'Rock'
++      GROUP BY d.year
++      ORDER BY d.year
++  - question: "Giá trị trung bình mỗi đơn hàng của từng quốc gia"
++    sql: |
++      SELECT c.country AS country,
++             ROUND(SUM(f.revenue) / COUNT(DISTINCT f.invoice_id), 2) AS avg_order_value
++      FROM dw.fact_sales f
++      JOIN dw.dim_customer c ON c.customer_key = f.customer_key
++      GROUP BY c.country
++      ORDER BY avg_order_value DESC
+diff --git a/src/test/java/com/fsoft/training/nl2sql/FewShotExamplesValidTest.java b/src/test/java/com/fsoft/training/nl2sql/FewShotExamplesValidTest.java
+new file mode 100644
+index 0000000..6e4a817
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/nl2sql/FewShotExamplesValidTest.java
+@@ -0,0 +1,35 @@
++package com.fsoft.training.nl2sql;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.fsoft.training.guardrail.GuardResult;
++import com.fsoft.training.guardrail.SqlGuard;
++import com.fsoft.training.support.PostgresIntegrationTest;
++import com.fsoft.training.warehouse.QueryResult;
++import com.fsoft.training.warehouse.SqlExecutor;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++
++class FewShotExamplesValidTest extends PostgresIntegrationTest {
++
++    @Autowired
++    FewShotSelector selector;
++
++    @Autowired
++    SqlGuard guard;
++
++    @Autowired
++    SqlExecutor executor;
++
++    @Test
++    void everyExamplePassesGuardAndExecutes() {
++        assertThat(selector.all()).hasSizeGreaterThanOrEqualTo(20);
++        for (FewShotExample e : selector.all()) {
++            GuardResult g = guard.check(e.sql());
++            assertThat(g.allowed()).as("guard: " + e.question() + " -> " + g.reason()).isTrue();
++            QueryResult r = executor.execute(g.safeSql());
++            assertThat(r.columns()).as("columns: " + e.question()).isNotEmpty();
++            assertThat(r.rows()).as("rows: " + e.question()).isNotEmpty();
++        }
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/nl2sql/FewShotSelectorTest.java b/src/test/java/com/fsoft/training/nl2sql/FewShotSelectorTest.java
+new file mode 100644
+index 0000000..2e9ab2c
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/nl2sql/FewShotSelectorTest.java
+@@ -0,0 +1,50 @@
++package com.fsoft.training.nl2sql;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.util.List;
++import org.junit.jupiter.api.Test;
++
++class FewShotSelectorTest {
++
++    private final FewShotSelector selector = new FewShotSelector();
++
++    @Test
++    void regionQuestionPicksRegionExample() {
++        List<FewShotExample> top = selector.select("doanh thu theo khu vực", 3);
++        assertThat(top).hasSize(3);
++        assertThat(top).anyMatch(e -> e.sql().contains("c.region AS region"));
++    }
++
++    @Test
++    void accentAndCaseInsensitive() {
++        assertThat(selector.select("DOANH THU THEO KHU VUC", 3))
++                .isEqualTo(selector.select("doanh thu theo khu vực", 3));
++    }
++
++    @Test
++    void emptyQuestionReturnsKExamples() {
++        assertThat(selector.select("", 3)).hasSize(3);
++    }
++
++    @Test
++    void kIsCappedAndDeterministic() {
++        int n = selector.all().size();
++        assertThat(n).isGreaterThanOrEqualTo(20);
++        assertThat(selector.select("top nghệ sĩ", n + 10)).hasSize(n);
++        assertThat(selector.select("top nghệ sĩ", 5)).isEqualTo(selector.select("top nghệ sĩ", 5));
++    }
++
++    @Test
++    void normalizeStripsDiacritics() {
++        assertThat(TextNormalizer.normalize("Doanh thu Đông Nam Á")).isEqualTo("doanh thu dong nam a");
++        assertThat(TextNormalizer.normalize("  Hello,   World! ")).isEqualTo("hello world");
++    }
++
++    @Test
++    void tokensDropStopwordsAndAddBigrams() {
++        assertThat(TextNormalizer.tokens("doanh thu của khu vực"))
++                .contains("doanh", "thu", "khu", "vuc", "_doanh thu")
++                .doesNotContain("cua");
++    }
++}

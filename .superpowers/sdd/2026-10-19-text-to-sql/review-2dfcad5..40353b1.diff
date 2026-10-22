@@ -1,0 +1,190 @@
+# Review package: 2dfcad5..HEAD
+
+## Commits
+40353b1 fix(guardrail): fail-closed check(), FETCH without count, AST keyword seam, CR ends comment
+
+## Files changed
+ .../com/fsoft/training/guardrail/SqlGuard.java     | 33 +++++++++++--
+ .../com/fsoft/training/guardrail/SqlGuardTest.java | 55 ++++++++++++++++++++++
+ 2 files changed, 84 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/guardrail/SqlGuard.java b/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
+index 203e962..a087251 100644
+--- a/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
++++ b/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
+@@ -71,21 +71,44 @@ public class SqlGuard {
+ 
+     /** Keyword forms that the parser reads as plain columns but that expose session information. */
+     private static final Set<String> KEYWORD_COLUMNS = Set.of(
+             "current_user", "session_user", "system_user", "user", "current_role", "current_schema",
+             "current_catalog");
+ 
+     private static final List<String> BLOCKED_PREFIXES = List.of(
+             "pg_", "lo_", "dblink",
+             "query_to_", "table_to_", "cursor_to_", "schema_to_", "database_to_");
+ 
++    /** Never throws: any unexpected failure inside the checks blocks the SQL (fail closed). */
+     public GuardResult check(String sql) {
++        try {
++            return checkUnguarded(sql);
++        } catch (RuntimeException | StackOverflowError e) {
++            return GuardResult.blocked("Không kiểm tra được câu SQL");
++        }
++    }
++
++    /** AST-only keyword-column inspection (no lexical backstop), exposed for tests. */
++    static Optional<String> astKeywordColumn(String sql) {
++        Statement statement;
++        try {
++            statement = CCJSqlParserUtil.parse(sql);
++        } catch (JSQLParserException e) {
++            throw new IllegalArgumentException(e);
++        }
++        Inspector inspector = new Inspector();
++        inspector.walk((Select) statement);
++        return Optional.ofNullable(inspector.keywordColumn);
++    }
++
++    /** All checks; may throw on unexpected parser/AST states, which {@link #check} turns into a block. */
++    GuardResult checkUnguarded(String sql) {
+         if (sql == null || sql.isBlank()) {
+             return GuardResult.blocked("SQL rỗng, không có gì để chạy.");
+         }
+         Statements statements;
+         try {
+             statements = CCJSqlParserUtil.parseStatements(sql);
+         } catch (JSQLParserException | RuntimeException e) {
+             return GuardResult.blocked("SQL không hợp lệ: không phân tích được cú pháp.");
+         }
+         if (statements == null || statements.size() != 1) {
+@@ -172,21 +195,21 @@ public class SqlGuard {
+                 if (i < 0) {
+                     return Optional.of(UNTERMINATED_REASON);
+                 }
+                 prev = '\'';
+                 continue;
+             }
+             if (c == '$') {
+                 return Optional.of(DOLLAR_REASON);
+             }
+             if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
+-                while (i < n && sql.charAt(i) != '\n') {
++                while (i < n && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') {
+                     i++;
+                 }
+                 continue;
+             }
+             if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
+                 int end = sql.indexOf("*/", i + 2);
+                 if (end < 0) {
+                     return Optional.of(UNTERMINATED_REASON);
+                 }
+                 i = end + 2;
+@@ -308,30 +331,32 @@ public class SqlGuard {
+         if (limit == null) {
+             limit = new Limit();
+             holder.setLimit(limit);
+         }
+         // Over the cap, LIMIT ALL / NULL, or an expression we cannot prove is <= MAX_ROWS: use the cap.
+         limit.setLimitAll(false);
+         limit.setLimitNull(false);
+         limit.setRowCount(new LongValue(cap));
+     }
+ 
+-    /** Row count of FETCH FIRST n ROWS ONLY; anything else (WITH TIES, expression) counts as MAX_ROWS. */
++    /**
++     * Row count of FETCH FIRST n ROWS ONLY; no count means 1 row (Postgres default); anything else
++     * (WITH TIES, expression, parameter) counts as MAX_ROWS.
++     */
+     private static long fetchRows(Fetch fetch) {
+         if (fetch.toString().toUpperCase(Locale.ROOT).contains("TIES")) {
+             return MAX_ROWS;
+         }
+         if (fetch.getExpression() instanceof LongValue rows) {
+             return rows.getValue();
+         }
+-        return fetch.getExpression() == null && fetch.getFetchJdbcParameter() == null
+-                ? fetch.getRowCount() : MAX_ROWS;
++        return fetch.getExpression() == null && fetch.getFetchJdbcParameter() == null ? 1 : MAX_ROWS;
+     }
+ 
+     /** Postgres folding: unquoted identifiers lowercase, quoted ones compare exactly. */
+     static String fold(String identifier) {
+         String n = identifier.strip();
+         if (n.length() >= 2 && n.startsWith("\"") && n.endsWith("\"")) {
+             return n.substring(1, n.length() - 1).replace("\"\"", "\"");
+         }
+         return n.toLowerCase(Locale.ROOT);
+     }
+diff --git a/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java b/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
+index 37638a5..632f820 100644
+--- a/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
++++ b/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
+@@ -396,11 +396,66 @@ class SqlGuardTest {
+                         + "FROM dw.dim_track",
+                 "SELECT count(*) FILTER (WHERE quantity > 1) AS c FROM dw.fact_sales",
+                 "SELECT DATE_TRUNC('month', d.full_date) AS m, count(*) FROM dw.dim_date d GROUP BY 1 ORDER BY 1"
+         };
+         for (String q : queries) {
+             GuardResult r = guard.check(q);
+             assertThat(r.allowed()).as("%s -> %s", q, r.reason()).isTrue();
+             assertThat(r.safeSql()).contains("LIMIT 1000");
+         }
+     }
++
++    // ---- round 4 ----
++
++    @Test
++    void fetchFirstWithoutCountIsOneRow() {
++        GuardResult r = guard.check("SELECT * FROM dw.dim_date FETCH FIRST ROWS ONLY");
++        assertThat(r.allowed()).as(r.reason()).isTrue();
++        assertThat(r.safeSql()).containsOnlyOnce("LIMIT").endsWith("LIMIT 1").doesNotContain("FETCH");
++
++        GuardResult one = guard.check("SELECT * FROM dw.dim_date FETCH NEXT 1 ROW ONLY");
++        assertThat(one.allowed()).as(one.reason()).isTrue();
++        assertThat(one.safeSql()).containsOnlyOnce("LIMIT").endsWith("LIMIT 1").doesNotContain("FETCH");
++    }
++
++    @Test
++    void checkNeverThrowsWhenAnInternalStepFails() {
++        SqlGuard failing = new SqlGuard() {
++            @Override
++            GuardResult checkUnguarded(String sql) {
++                throw new IllegalStateException("boom");
++            }
++        };
++        GuardResult r = failing.check("SELECT * FROM dw.dim_date");
++        assertThat(r.allowed()).isFalse();
++        assertThat(r.reason()).isEqualTo("Không kiểm tra được câu SQL");
++    }
++
++    @Test
++    void astInspectionBlocksKeywordColumnsWithoutTheLexer() {
++        assertThat(SqlGuard.astKeywordColumn("SELECT current_user FROM dw.dim_date")).contains("current_user");
++        assertThat(SqlGuard.astKeywordColumn("SELECT x FROM dw.dim_date WHERE session_user = 'a'"))
++                .contains("session_user");
++        assertThat(SqlGuard.astKeywordColumn("SELECT d.user FROM dw.dim_date d")).isEmpty();
++        assertThat(SqlGuard.astKeywordColumn("SELECT \"user\" FROM dw.dim_date")).isEmpty();
++        assertThat(SqlGuard.astKeywordColumn("SELECT date_key FROM dw.dim_date")).isEmpty();
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {
++            "SELECT a FROM dw.dim_date UNION TABLE app.users",
++            "WITH x AS (TABLE app.users) SELECT * FROM x",
++            "SELECT * FROM dw.dim_date WHERE 1 IN (TABLE users)"
++    })
++    void blocksNestedTableForms(String sql) {
++        GuardResult r = guard.check(sql);
++        assertThat(r.allowed()).as(sql).isFalse();
++        assertThat(r.reason()).isNotBlank();
++    }
++
++    @Test
++    void lineCommentEndsAtCarriageReturn() {
++        assertThat(SqlGuard.lexicalBackstop("SELECT x FROM dw.dim_date -- c\r, pg_sleep(1)")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT x FROM dw.dim_date -- c\rWHERE current_user = 'a'")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT x FROM dw.dim_date -- pg_sleep(1)\r")).isEmpty();
++    }
+ }

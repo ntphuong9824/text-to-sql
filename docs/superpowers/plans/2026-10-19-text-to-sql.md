@@ -267,7 +267,24 @@ Quy tắc, theo thứ tự:
   - Cột không tồn tại → ném `SqlExecutionException`, message chứa `column`.
   - `QueryResult` serialize bằng `JsonMapper` không lỗi.
 - [ ] **Step 2:** Chạy. Kỳ vọng: FAIL. Implement. Chạy lại. Kỳ vọng: PASS.
-- [ ] **Step 3:** Commit: `feat(warehouse): add read-only SQL executor`.
+- [ ] **Step 3: Thêm lớp kiểm tra bằng planner** *(bổ sung khi thực thi plan. Lý do: duyệt AST bằng JSqlParser không bao giờ đảm bảo phủ đủ mọi nhánh. Postgres mới là bên phân giải tên, schema, phạm vi CTE và view một cách chính xác)*.
+  - Tạo `warehouse/PlanInspector.java` (`@Component`), có hàm `Optional<String> violation(String safeSql)`.
+  - Cách làm: dùng `analystJdbcTemplate` chạy `EXPLAIN (VERBOSE, FORMAT JSON) <safeSql>`, rồi duyệt đệ quy cây plan JSON:
+    - Node nào có `"Relation Name"` thì `"Schema"` phải là `dw`. Nếu không, trả lý do tiếng Việt kèm tên `schema.bảng`. View như `pg_user` sẽ hiện ra dưới dạng các bảng `pg_catalog` bên dưới nên cũng bị bắt.
+    - Node nào có `"Function Name"` (Function Scan) thì tên hàm phải không thỏa `SqlGuard.isBlockedFunction`.
+    - Các trường text (`Output`, `Filter`, `Join Filter`, `Hash Cond`, `Index Cond`, `Sort Key`, `Group Key`, `One-Time Filter`...): quét các identifier đứng ngay trước `(`, rồi kiểm tra từng tên bằng `isBlockedFunction`.
+    - EXPLAIN mà lỗi (ví dụ thiếu quyền) thì trả `Optional.empty()`, để lỗi thật xuất hiện lúc execute và đi vào vòng tự sửa lỗi.
+  - Yêu cầu `isBlockedFunction(String)` của `SqlGuard` là `public static`.
+  - `SqlExecutor.execute` gọi `PlanInspector.violation` trước khi chạy. Có vi phạm thì ném `SqlPolicyViolationException(reason)`. Lớp này **không** kế thừa `SqlExecutionException`: pipeline sẽ coi nó là BLOCKED và không gửi lại cho LLM sửa.
+  - Test `PlanInspectorTest` (integration):
+    - `SELECT * FROM pg_user` (truyền thẳng vào, bỏ qua `SqlGuard`) → có vi phạm, lý do chứa `pg_catalog`.
+    - `WITH "PG_USER" AS (SELECT 1) SELECT * FROM pg_user` → có vi phạm.
+    - `SELECT * FROM (dw.dim_date d CROSS JOIN pg_user)` → có vi phạm.
+    - `SELECT 1 FROM dw.dim_date WHERE pg_sleep(0) IS NULL` → có vi phạm (bắt qua trường Filter).
+    - `SELECT region, sum(revenue) FROM dw.fact_sales f JOIN dw.dim_customer c USING (customer_key) GROUP BY region` → không vi phạm.
+    - Câu có CTE và window function trên `dw` → không vi phạm.
+    - `SqlExecutor.execute("SELECT * FROM pg_user")` → ném `SqlPolicyViolationException`.
+- [ ] **Step 4:** Commit: `feat(warehouse): add read-only SQL executor with planner-based policy check`.
 
 ---
 

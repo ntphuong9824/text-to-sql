@@ -1,0 +1,50 @@
+spring:
+  application:
+    name: text-to-sql
+  config:
+    # Local secrets (LLM_API_KEY, JWT_SECRET) from a gitignored .env next to the working directory.
+    import: optional:file:.env[.properties]
+  flyway:
+    schemas: app
+    default-schema: app
+    locations: classpath:db/migration
+    fail-on-missing-locations: false
+    create-schemas: false
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:}
+    ttl: 24h
+  cors:
+    allowed-origins: http://localhost:5173
+  datasource:
+    app:
+      url: jdbc:postgresql://localhost:5432/textsql
+      username: ${APP_DB_USER:app_rw}
+      password: ${APP_DB_PASSWORD:app_rw_dev}
+    analyst:
+      url: jdbc:postgresql://localhost:5432/textsql
+      username: ${ANALYST_DB_USER:analyst_ro}
+      password: ${ANALYST_DB_PASSWORD:analyst_ro_dev}
+
+llm:
+  base-url: ${LLM_BASE_URL:https://generativelanguage.googleapis.com/v1beta/openai/}
+  api-key: ${LLM_API_KEY:}
+  model: ${LLM_MODEL:gemini-3.5-flash-lite}
+  timeout: 30s
+  max-retries: 3
+  temperature: 0
+
+---
+# Offline eval run: ./mvnw spring-boot:run -Dspring-boot.run.profiles=eval (needs LLM_API_KEY).
+spring:
+  config:
+    activate:
+      on-profile: eval
+  main:
+    web-application-type: none
+
+eval:
+  set-path: eval/eval-set.yaml
+  report-dir: eval/reports
+  delay-ms: 4500

@@ -1,0 +1,224 @@
+# Review package: dbd297b..HEAD
+
+## Commits
+01537b2 fix(warehouse): timestamptz columns, quoted-identifier evasion, keyword session functions in PlanInspector
+
+## Files changed
+ .../fsoft/training/warehouse/PlanInspector.java    | 37 ++++++++++++++++------
+ .../com/fsoft/training/warehouse/SqlExecutor.java  | 10 +++---
+ .../training/warehouse/PlanInspectorTest.java      | 14 ++++++++
+ .../fsoft/training/warehouse/SqlExecutorTest.java  | 15 +++++++++
+ 4 files changed, 62 insertions(+), 14 deletions(-)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/warehouse/PlanInspector.java b/src/main/java/com/fsoft/training/warehouse/PlanInspector.java
+index e193dc7..3e6c2b5 100644
+--- a/src/main/java/com/fsoft/training/warehouse/PlanInspector.java
++++ b/src/main/java/com/fsoft/training/warehouse/PlanInspector.java
+@@ -14,20 +14,25 @@ import tools.jackson.databind.json.JsonMapper;
+ /**
+  * Second guardrail layer: asks the Postgres planner (EXPLAIN) what the query really touches, so name,
+  * schema, CTE and view resolution is done by Postgres rather than by walking the SQL AST.
+  */
+ @Component
+ public class PlanInspector {
+ 
+     private static final String ALLOWED_SCHEMA = "dw";
+     private static final Pattern CALL = Pattern.compile("([A-Za-z_][A-Za-z0-9_$]*)\\s*\\(");
+ 
++    /** Session keywords that Postgres prints without parentheses. */
++    private static final Pattern KEYWORD = Pattern.compile(
++            "(?i)(?<![A-Za-z0-9_$])(current_user|session_user|current_role|current_schema|current_catalog"
++                    + "|system_user|user)(?![A-Za-z0-9_$])");
++
+     private final JdbcTemplate jdbc;
+     private final JsonMapper mapper = JsonMapper.builder().build();
+ 
+     public PlanInspector(@Qualifier("analyst") JdbcTemplate analystJdbcTemplate) {
+         this.jdbc = analystJdbcTemplate;
+     }
+ 
+     /** @return a Vietnamese reason if the plan breaks policy; empty if fine or if EXPLAIN itself fails. */
+     public Optional<String> violation(String safeSql) {
+         String json;
+@@ -73,44 +78,56 @@ public class PlanInspector {
+                     return reason;
+                 }
+             }
+         } else if (node.isString()) {
+             return scanText(node.asString());
+         }
+         return null;
+     }
+ 
+     private static String scanText(String text) {
+-        Matcher m = CALL.matcher(stripLiterals(text));
++        String code = stripLiterals(text);
++        Matcher kw = KEYWORD.matcher(code);
++        if (kw.find()) {
++            return blocked(kw.group(1).toLowerCase(Locale.ROOT));
++        }
++        Matcher m = CALL.matcher(code);
+         while (m.find()) {
+             String name = m.group(1).toLowerCase(Locale.ROOT);
+             if (SqlGuard.isBlockedFunction(name)) {
+                 return blocked(name);
+             }
+         }
+         return null;
+     }
+ 
+-    /** Removes single-quoted literals ('' is an escaped quote) so strings never look like calls. */
++    /**
++     * Blanks out single-quoted literals ('' escape) and double-quoted identifiers ("" escape) so that
++     * neither can look like a call, and so a quote inside one kind never confuses the other.
++     */
+     private static String stripLiterals(String text) {
+         StringBuilder sb = new StringBuilder(text.length());
+-        boolean in = false;
++        char quote = 0;
+         for (int i = 0; i < text.length(); i++) {
+             char c = text.charAt(i);
+-            if (c == '\'') {
+-                if (in && i + 1 < text.length() && text.charAt(i + 1) == '\'') {
+-                    i++;
+-                } else {
+-                    in = !in;
+-                    sb.append(' ');
++            if (quote != 0) {
++                if (c == quote) {
++                    if (i + 1 < text.length() && text.charAt(i + 1) == quote) {
++                        i++;
++                    } else {
++                        quote = 0;
++                    }
+                 }
+-            } else if (!in) {
++            } else if (c == '\'' || c == '"') {
++                quote = c;
++                sb.append(' ');
++            } else {
+                 sb.append(c);
+             }
+         }
+         return sb.toString();
+     }
+ 
+     private static String blocked(String name) {
+         return "Hàm '" + name + "' bị cấm vì lý do an toàn.";
+     }
+ }
+diff --git a/src/main/java/com/fsoft/training/warehouse/SqlExecutor.java b/src/main/java/com/fsoft/training/warehouse/SqlExecutor.java
+index 4378648..b84b674 100644
+--- a/src/main/java/com/fsoft/training/warehouse/SqlExecutor.java
++++ b/src/main/java/com/fsoft/training/warehouse/SqlExecutor.java
+@@ -62,42 +62,44 @@ public class SqlExecutor {
+         }
+         List<List<Object>> rows = new ArrayList<>();
+         boolean truncated = false;
+         while (rs.next()) {
+             if (rows.size() == MAX_ROWS) {
+                 truncated = true;
+                 break;
+             }
+             List<Object> row = new ArrayList<>(n);
+             for (int i = 1; i <= n; i++) {
+-                row.add(value(rs, i, md.getColumnType(i)));
++                row.add(value(rs, i, md.getColumnType(i), md.getColumnTypeName(i)));
+             }
+             rows.add(row);
+         }
+         return new QueryResult(columns, rows, truncated);
+     }
+ 
+     static String typeOf(int sqlType) {
+         return switch (sqlType) {
+             case Types.TINYINT, Types.SMALLINT, Types.INTEGER, Types.BIGINT, Types.NUMERIC, Types.DECIMAL,
+                  Types.FLOAT, Types.REAL, Types.DOUBLE -> "number";
+             case Types.DATE, Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE -> "date";
+             case Types.BOOLEAN, Types.BIT -> "boolean";
+             default -> "text";
+         };
+     }
+ 
+-    private static Object value(ResultSet rs, int i, int sqlType) throws SQLException {
++    private static Object value(ResultSet rs, int i, int sqlType, String typeName) throws SQLException {
+         Object raw = switch (sqlType) {
+             case Types.DATE -> rs.getObject(i, LocalDate.class);
+-            case Types.TIMESTAMP -> rs.getObject(i, LocalDateTime.class);
+-            case Types.TIMESTAMP_WITH_TIMEZONE -> rs.getObject(i, OffsetDateTime.class);
++            // pgjdbc reports timestamptz as Types.TIMESTAMP, so the type name decides.
++            case Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE -> "timestamptz".equalsIgnoreCase(typeName)
++                    ? rs.getObject(i, OffsetDateTime.class)
++                    : rs.getObject(i, LocalDateTime.class);
+             default -> rs.getObject(i);
+         };
+         if (raw == null) {
+             return null;
+         }
+         return switch (raw) {
+             case Short v -> v.longValue();
+             case Integer v -> v.longValue();
+             case Long v -> v;
+             case BigDecimal v -> v;
+diff --git a/src/test/java/com/fsoft/training/warehouse/PlanInspectorTest.java b/src/test/java/com/fsoft/training/warehouse/PlanInspectorTest.java
+index 0e6160f..1f23c3c 100644
+--- a/src/test/java/com/fsoft/training/warehouse/PlanInspectorTest.java
++++ b/src/test/java/com/fsoft/training/warehouse/PlanInspectorTest.java
+@@ -47,11 +47,25 @@ class PlanInspectorTest extends PostgresIntegrationTest {
+     void cteAndWindowFunctionAreAllowed() {
+         assertThat(inspector.violation("WITH t AS (SELECT date_key, sum(revenue) r FROM dw.fact_sales GROUP BY date_key) "
+                 + "SELECT date_key, r, rank() OVER (ORDER BY r DESC) FROM t")).isEmpty();
+     }
+ 
+     @Test
+     void explainFailureReturnsEmpty() {
+         assertThat(inspector.violation("SELECT * FROM chinook.album")).isEmpty();
+         assertThat(inspector.violation("SELECT nope FROM dw.dim_date")).isEmpty();
+     }
++
++    @Test
++    void quoteInsideQuotedIdentifierDoesNotHideCall() {
++        assertThat(inspector.violation("SELECT 1 FROM dw.dim_date \"a'b\" WHERE \"a'b\".month_name = 'x' "
++                + "OR pg_sleep(0) IS NULL LIMIT 1")).isPresent();
++    }
++
++    @Test
++    void keywordSessionFunctionsAreCaught() {
++        for (String kw : new String[] {"current_user", "session_user", "current_role", "current_schema",
++                "current_catalog", "user"}) {
++            assertThat(inspector.violation("SELECT " + kw)).as(kw).isPresent();
++        }
++    }
+ }
+diff --git a/src/test/java/com/fsoft/training/warehouse/SqlExecutorTest.java b/src/test/java/com/fsoft/training/warehouse/SqlExecutorTest.java
+index 26fdaf0..e649a95 100644
+--- a/src/test/java/com/fsoft/training/warehouse/SqlExecutorTest.java
++++ b/src/test/java/com/fsoft/training/warehouse/SqlExecutorTest.java
+@@ -68,11 +68,26 @@ class SqlExecutorTest extends PostgresIntegrationTest {
+         assertThatThrownBy(() -> executor.execute("SELECT * FROM pg_user"))
+                 .isInstanceOf(SqlPolicyViolationException.class)
+                 .isNotInstanceOf(SqlExecutionException.class);
+     }
+ 
+     @Test
+     void resultSerializesToJson() {
+         String json = JsonMapper.builder().build().writeValueAsString(executor.execute(BY_REGION));
+         assertThat(json).contains("\"columns\"").contains("\"truncated\":false");
+     }
++
++    @Test
++    void timestamptzColumnIsDateWithIsoString() {
++        QueryResult r = executor.execute("select date_trunc('month', full_date) m from dw.dim_date limit 1");
++        assertThat(r.columns().get(0).type()).isEqualTo("date");
++        assertThat((String) r.rows().get(0).get(0)).startsWith("20").contains("T");
++    }
++
++    @Test
++    void plainTimestampAndNowWork() {
++        QueryResult r = executor.execute("select full_date::timestamp as a, now() as b from dw.dim_date limit 1");
++        assertThat(r.columns()).extracting(ColumnInfo::type).containsExactly("date", "date");
++        assertThat(r.rows().get(0).get(0)).isInstanceOf(String.class);
++        assertThat(r.rows().get(0).get(1)).isInstanceOf(String.class);
++    }
+ }
