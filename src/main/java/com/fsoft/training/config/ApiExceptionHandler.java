@@ -43,6 +43,12 @@ public class ApiExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(new ErrorResponse("Tên đăng nhập đã tồn tại"));
     }
 
+    @ExceptionHandler(com.fsoft.training.conversation.ConversationNotFoundException.class)
+    ResponseEntity<ErrorResponse> onConversationNotFound(
+            com.fsoft.training.conversation.ConversationNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ErrorResponse("Không tìm thấy hội thoại"));
+    }
+
     private static String messageFor(HttpStatusCode status) {
         return switch (status.value()) {
             case 400 -> "Yêu cầu không hợp lệ";
