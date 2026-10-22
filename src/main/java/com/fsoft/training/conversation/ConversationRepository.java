@@ -32,6 +32,12 @@ public class ConversationRepository {
                 .optional();
     }
 
+    /** Row-locks the conversation until the transaction ends; false if it is gone or not the user's. */
+    public boolean lockOwned(UUID id, long userId) {
+        return jdbc.sql("select 1 from app.conversations where id = :id and user_id = :user for update")
+                .param("id", id).param("user", userId).query(Integer.class).optional().isPresent();
+    }
+
     public List<ConversationSummary> list(long userId) {
         return jdbc.sql("select id, title, updated_at from app.conversations where user_id = :user "
                         + "order by updated_at desc, created_at desc")

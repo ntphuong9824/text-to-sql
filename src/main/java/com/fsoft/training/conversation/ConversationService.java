@@ -9,6 +9,7 @@ import com.fsoft.training.nl2sql.TurnContext;
 import com.fsoft.training.nl2sql.TurnOutcome;
 import com.fsoft.training.nl2sql.TurnStatus;
 import com.fsoft.training.warehouse.ColumnInfo;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -54,11 +55,16 @@ public class ConversationService {
         TurnOutcome outcome = pipeline.run(question, history);
 
         TurnDto turn = tx.execute(status -> {
+            // Serializes concurrent asks on one conversation and detects deletion during the pipeline run.
+            if (!conversations.lockOwned(id, userId)) {
+                throw new ConversationNotFoundException();
+            }
             int index = messages.count(id);
-            messages.insert(id, index, question, outcome.rewrittenQuestion(), outcome.sql(), outcome.status(),
-                    outcome.message(), outcome.result(), outcome.chart());
+            Instant createdAt = messages.insert(id, index, question, outcome.rewrittenQuestion(), outcome.sql(),
+                    outcome.status(), outcome.message(), outcome.result(), outcome.chart());
             conversations.touch(id);
-            return messages.findAll(id).stream().filter(t -> t.turnIndex() == index).findFirst().orElseThrow();
+            return new TurnDto(index, question, outcome.rewrittenQuestion(), outcome.sql(), outcome.status(),
+                    outcome.message(), outcome.result(), outcome.chart(), createdAt);
         });
         return new ChatResponse(id, title, turn);
     }

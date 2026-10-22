@@ -6,18 +6,21 @@ import com.fsoft.training.nl2sql.TurnStatus;
 import com.fsoft.training.warehouse.QueryResult;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
+import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.json.JsonMapper;
 
 @Repository
 public class MessageRepository {
 
     private final JdbcClient jdbc;
-    private final JsonMapper mapper = JsonMapper.builder().build();
+    private final JsonMapper mapper = JsonMapper.builder()
+            .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).build();
 
     public MessageRepository(JdbcClient jdbc) {
         this.jdbc = jdbc;
@@ -28,17 +31,19 @@ public class MessageRepository {
                 .param("c", conversationId).query(Integer.class).single();
     }
 
-    public void insert(UUID conversationId, int turnIndex, String question, String rewritten, String sql,
+    /** @return the stored created_at */
+    public Instant insert(UUID conversationId, int turnIndex, String question, String rewritten, String sql,
                        TurnStatus status, String message, QueryResult result, ChartSpec chart) {
-        jdbc.sql("insert into app.messages(conversation_id, turn_index, question, rewritten_question, sql, "
+        return jdbc.sql("insert into app.messages(conversation_id, turn_index, question, rewritten_question, sql, "
                         + "status, message, chart, result) values (:c, :idx, :q, :rq, :sql, :status, :msg, "
-                        + "cast(:chart as jsonb), cast(:result as jsonb))")
+                        + "cast(:chart as jsonb), cast(:result as jsonb)) returning created_at")
                 .param("c", conversationId).param("idx", turnIndex).param("q", question)
                 .param("rq", rewritten).param("sql", sql).param("status", status.name())
                 .param("msg", message)
                 .param("chart", chart == null ? null : mapper.writeValueAsString(chart))
                 .param("result", result == null ? null : mapper.writeValueAsString(result))
-                .update();
+                .query((rs, n) -> rs.getObject("created_at", OffsetDateTime.class).toInstant())
+                .single();
     }
 
     /** All turns, oldest first. */

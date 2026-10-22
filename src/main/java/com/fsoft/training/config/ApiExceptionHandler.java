@@ -49,6 +49,14 @@ public class ApiExceptionHandler {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ErrorResponse("Không tìm thấy hội thoại"));
     }
 
+    /** A malformed id (e.g. a non-UUID path variable) is indistinguishable from a missing resource. */
+    @ExceptionHandler(org.springframework.web.method.annotation.MethodArgumentTypeMismatchException.class)
+    ResponseEntity<ErrorResponse> onTypeMismatch(
+            org.springframework.web.method.annotation.MethodArgumentTypeMismatchException ex) {
+        log.debug("Malformed path/query argument", ex);
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ErrorResponse("Không tìm thấy hội thoại"));
+    }
+
     private static String messageFor(HttpStatusCode status) {
         return switch (status.value()) {
             case 400 -> "Yêu cầu không hợp lệ";

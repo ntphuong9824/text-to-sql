@@ -201,4 +201,51 @@ class ChatApiTest extends PostgresIntegrationTest {
                 .andExpect(status().isNotFound());
         assertThat(superuserJdbc().queryForObject("select count(*) from app.messages", Integer.class)).isZero();
     }
+
+    @Test
+    void malformedConversationIdIs404() throws Exception {
+        mvc.perform(get("/api/conversations/abc").header("Authorization", alice))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.message").value("Không tìm thấy hội thoại"));
+        mvc.perform(delete("/api/conversations/abc").header("Authorization", alice))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void historyReplaysExactlyWhatTheLiveTurnReturned() throws Exception {
+        JsonMapper exact = JsonMapper.builder()
+                .enable(tools.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).build();
+        llm.enqueue("SELECT region AS r, CAST(NULL AS int) AS n, ROUND(SUM(revenue), 2) AS total, "
+                + "CAST(100.00 AS numeric(10,2)) AS hundred FROM dw.fact_sales f "
+                + "JOIN dw.dim_customer c ON c.customer_key = f.customer_key GROUP BY region");
+        MvcResult live = chat(alice, null, "tổng doanh thu", 200);
+        JsonNode liveRes = exact.readTree(live.getResponse().getContentAsString());
+        assertThat(liveRes.get("turn").get("status").asString()).isEqualTo("OK");
+        assertThat(live.getResponse().getContentAsString()).contains("100.00");
+        String id = liveRes.get("conversationId").asString();
+        JsonNode hist = exact.readTree(mvc.perform(get("/api/conversations/" + id).header("Authorization", alice))
+                .andReturn().getResponse().getContentAsString());
+        assertThat(hist.get("turns").get(0)).isEqualTo(liveRes.get("turn"));
+        assertThat(hist.get("turns").get(0).get("result").toString())
+                .isEqualTo(liveRes.get("turn").get("result").toString()).contains("100.00");
+        assertThat(hist.get("turns").get(0).get("result").get("truncated").asBoolean()).isFalse();
+    }
+
+    @Test
+    void conversationDeletedWhilePipelineRunsIs404() throws Exception {
+        String id = firstChat();
+        llm.reset();
+        llm.onComplete(() -> superuserJdbc().update("delete from app.conversations"));
+        llm.enqueue("doanh thu tháng 10 theo khu vực", GOOD_SQL);
+        chat(alice, id, "còn tháng 10?", 404);
+        assertThat(superuserJdbc().queryForObject("select count(*) from app.messages", Integer.class)).isZero();
+    }
+
+    @Test
+    void duplicateTurnIndexIsRejectedByDatabase() throws Exception {
+        String id = firstChat();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> superuserJdbc().update(
+                "insert into app.messages(conversation_id, turn_index, question, status) values (?::uuid, 0, 'x', 'OK')", id))
+                .isInstanceOf(org.springframework.dao.DuplicateKeyException.class);
+    }
 }
