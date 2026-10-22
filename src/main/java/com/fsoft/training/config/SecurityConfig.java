@@ -8,6 +8,7 @@ import java.util.List;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.MediaType;
@@ -34,7 +35,9 @@ import tools.jackson.databind.ObjectMapper;
 @Configuration
 public class SecurityConfig {
 
+    /** Not created for non-web runs (the {@code eval} profile), where there is no HttpSecurity. */
     @Bean
+    @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
     SecurityFilterChain securityFilterChain(HttpSecurity http, ObjectMapper objectMapper) throws Exception {
         AuthenticationEntryPoint unauthorized = (request, response, ex) -> {
             response.setStatus(401);

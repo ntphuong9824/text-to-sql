@@ -31,3 +31,17 @@ llm:
   timeout: 30s
   max-retries: 3
   temperature: 0
+
+---
+# Offline eval run: ./mvnw spring-boot:run -Dspring-boot.run.profiles=eval (needs LLM_API_KEY).
+spring:
+  config:
+    activate:
+      on-profile: eval
+  main:
+    web-application-type: none
+
+eval:
+  set-path: eval/eval-set.yaml
+  report-dir: eval/reports
+  delay-ms: 4500
