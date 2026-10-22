@@ -147,7 +147,9 @@ class AuthFlowTest extends PostgresIntegrationTest {
 
     @Test
     void analystCannotReadAppUsers() {
-        assertThatThrownBy(() -> analyst.queryForList("select * from app.users")).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> analyst.queryForList("select * from app.users"))
+                .isInstanceOf(DataAccessException.class)
+                .rootCause().hasMessageContaining("permission denied");
     }
 
     private String token(Duration ttl) {

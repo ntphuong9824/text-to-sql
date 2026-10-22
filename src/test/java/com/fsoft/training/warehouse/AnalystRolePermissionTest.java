@@ -24,13 +24,15 @@ class AnalystRolePermissionTest extends PostgresIntegrationTest {
     @Test
     void cannotReadRawChinook() {
         assertThatThrownBy(() -> analyst.queryForList("select * from chinook.invoice"))
-                .isInstanceOf(DataAccessException.class);
+                .isInstanceOf(DataAccessException.class)
+                .rootCause().hasMessageContaining("permission denied");
     }
 
     @Test
     void cannotReadAppSchema() {
         assertThatThrownBy(() -> analyst.queryForList("select * from app.users"))
-                .isInstanceOf(DataAccessException.class);
+                .isInstanceOf(DataAccessException.class)
+                .rootCause().hasMessageContaining("permission denied");
     }
 
     @Test
@@ -38,7 +40,13 @@ class AnalystRolePermissionTest extends PostgresIntegrationTest {
         assertThatThrownBy(() -> analyst.update(
                 "insert into dw.dim_date(date_key, full_date, day, month, month_name, quarter, year)"
                         + " values (19000101, date '1900-01-01', 1, 1, 'January', 1, 1900)"))
-                .isInstanceOf(DataAccessException.class);
+                .isInstanceOf(DataAccessException.class)
+                .rootCause().hasMessageMatching("(?s).*(read-only transaction|permission denied).*");
+    }
+
+    @Test
+    void sessionIsReadOnlyByDefault() {
+        assertThat(analyst.queryForObject("show default_transaction_read_only", String.class)).isEqualTo("on");
     }
 
     @Test
