@@ -2,7 +2,7 @@ const SUGGESTIONS = [
   'Doanh thu tháng 9 theo khu vực',
   'Top 5 sản phẩm bán chạy nhất',
   'Số đơn hàng theo từng tháng',
-  'Tổng doanh thu năm nay',
+  'Tổng doanh thu năm 2025',
 ]
 
 export default function SuggestedQuestions({

@@ -24,6 +24,12 @@ class SchemaPromptRendererTest {
     }
 
     @Test
+    void rendersLatestDataYearRule() {
+        assertThat(out).contains("năm mới nhất có dữ liệu", "SELECT MAX(year) FROM dw.dim_date d JOIN dw.fact_sales f",
+                "không dùng current_date");
+    }
+
+    @Test
     void tableLineHasColumnShape() {
         assertThat(out).containsPattern("dw\\.fact_sales\\(sales_key int -- [^,]+");
         assertThat(out).containsPattern("revenue numeric -- unit_price \\* quantity; đồng nghĩa: doanh thu");
