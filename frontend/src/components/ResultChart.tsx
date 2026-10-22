@@ -109,6 +109,7 @@ export default function ResultChart({ chart, result, size }: Props) {
     )
   } else {
     const data = pieData(points.filter((p) => p.y > 0))
+    if (data.length === 0) return null
     body = (
       <PieChart width={size?.width} height={size?.height}>
         <Tooltip formatter={tip} contentStyle={tooltipStyle} />

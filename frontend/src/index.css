@@ -348,8 +348,8 @@ main:not(.chat) {
   margin: 4rem auto;
   padding: 0 1rem;
 }
-[role='alert'] {
-  color: inherit;
+main:not(.chat) [role='alert'] {
+  color: var(--err-fg);
 }
 
 @media (max-width: 767px) {

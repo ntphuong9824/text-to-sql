@@ -41,4 +41,15 @@ describe('ResultChart', () => {
     )
     expect(screen.getByRole('img', { name: /total theo month/ })).toBeInTheDocument()
   })
+
+  it('renders nothing for a PIE with no positive values', () => {
+    const { container } = render(
+      <ResultChart
+        chart={{ type: 'PIE', xColumn: 'month', yColumn: 'total' }}
+        result={{ ...result, rows: [['T1', 0], ['T2', -3]] }}
+        size={{ width: 400, height: 250 }}
+      />,
+    )
+    expect(container).toBeEmptyDOMElement()
+  })
 })
