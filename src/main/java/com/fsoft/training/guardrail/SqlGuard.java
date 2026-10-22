@@ -9,6 +9,9 @@ import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import net.sf.jsqlparser.JSQLParserException;
 import net.sf.jsqlparser.expression.AnalyticExpression;
 import net.sf.jsqlparser.expression.Expression;
@@ -55,6 +58,9 @@ import org.springframework.stereotype.Component;
 @Component
 public class SqlGuard {
 
+    private static final Logger log = LoggerFactory.getLogger(SqlGuard.class);
+
+    /** Max rows shown to the user; the guard imposes LIMIT MAX_ROWS + 1 so truncation is detectable. */
     public static final int MAX_ROWS = 1000;
 
     private static final String ALLOWED_SCHEMA = "dw";
@@ -83,6 +89,7 @@ public class SqlGuard {
         try {
             return checkUnguarded(sql);
         } catch (RuntimeException | StackOverflowError e) {
+            log.debug("SqlGuard failed closed on unexpected error", e);
             return GuardResult.blocked("Không kiểm tra được câu SQL");
         }
     }
@@ -318,14 +325,19 @@ public class SqlGuard {
                 holder = last;
             }
         }
-        long cap = MAX_ROWS;
+        // An imposed cap is MAX_ROWS + 1 so the executor can see row 1001 and flag truncation;
+        // an explicit literal LIMIT/FETCH <= MAX_ROWS is kept as the user wrote it.
+        long cap = MAX_ROWS + 1L;
         Limit limit = holder.getLimit();
-        if (limit != null && limit.getRowCount() instanceof LongValue rows) {
+        if (limit != null && limit.getRowCount() instanceof LongValue rows && rows.getValue() <= MAX_ROWS) {
             cap = Math.min(cap, rows.getValue());
         }
         Fetch fetch = holder.getFetch();
         if (fetch != null) {
-            cap = Math.min(cap, fetchRows(fetch));
+            long fetched = fetchRows(fetch);
+            if (fetched <= MAX_ROWS) {
+                cap = Math.min(cap, fetched);
+            }
             holder.setFetch(null);
         }
         if (limit == null) {
@@ -340,16 +352,16 @@ public class SqlGuard {
 
     /**
      * Row count of FETCH FIRST n ROWS ONLY; no count means 1 row (Postgres default); anything else
-     * (WITH TIES, expression, parameter) counts as MAX_ROWS.
+     * (WITH TIES, expression, parameter) counts as over the cap.
      */
     private static long fetchRows(Fetch fetch) {
         if (fetch.toString().toUpperCase(Locale.ROOT).contains("TIES")) {
-            return MAX_ROWS;
+            return MAX_ROWS + 1L;
         }
         if (fetch.getExpression() instanceof LongValue rows) {
             return rows.getValue();
         }
-        return fetch.getExpression() == null && fetch.getFetchJdbcParameter() == null ? 1 : MAX_ROWS;
+        return fetch.getExpression() == null && fetch.getFetchJdbcParameter() == null ? 1 : MAX_ROWS + 1L;
     }
 
     /** Postgres folding: unquoted identifiers lowercase, quoted ones compare exactly. */

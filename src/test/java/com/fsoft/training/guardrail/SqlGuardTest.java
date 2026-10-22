@@ -195,10 +195,10 @@ class SqlGuardTest {
         GuardResult big = guard.check(
                 "SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales LIMIT 99999 OFFSET 5");
         assertThat(big.allowed()).as(big.reason()).isTrue();
-        assertThat(big.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 1000").contains("OFFSET 5");
+        assertThat(big.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 1001").contains("OFFSET 5");
 
         GuardResult none = guard.check("SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales");
-        assertThat(none.safeSql()).containsOnlyOnce("LIMIT").endsWith("LIMIT 1000");
+        assertThat(none.safeSql()).containsOnlyOnce("LIMIT").endsWith("LIMIT 1001");
     }
 
     @Test
@@ -289,15 +289,15 @@ class SqlGuardTest {
     void fetchFirstBecomesCappedLimit() {
         GuardResult small = guard.check("SELECT * FROM dw.fact_sales FETCH FIRST 10 ROWS ONLY");
         assertThat(small.allowed()).as(small.reason()).isTrue();
-        assertThat(small.safeSql()).contains("LIMIT 10").doesNotContain("FETCH").doesNotContain("1000");
+        assertThat(small.safeSql()).contains("LIMIT 10").doesNotContain("FETCH").doesNotContain("1001");
 
         GuardResult big = guard.check("SELECT * FROM dw.fact_sales FETCH FIRST 5000 ROWS ONLY");
         assertThat(big.allowed()).as(big.reason()).isTrue();
-        assertThat(big.safeSql()).contains("LIMIT 1000").doesNotContain("FETCH").doesNotContain("5000");
+        assertThat(big.safeSql()).contains("LIMIT 1001").doesNotContain("FETCH").doesNotContain("5000");
 
         GuardResult ties = guard.check("SELECT * FROM dw.fact_sales ORDER BY sales_key FETCH FIRST 5 ROWS WITH TIES");
         assertThat(ties.allowed()).as(ties.reason()).isTrue();
-        assertThat(ties.safeSql()).contains("LIMIT 1000").doesNotContain("FETCH").doesNotContain("TIES");
+        assertThat(ties.safeSql()).contains("LIMIT 1001").doesNotContain("FETCH").doesNotContain("TIES");
 
         GuardResult offset = guard.check("SELECT * FROM dw.fact_sales OFFSET 3 ROWS FETCH NEXT 7 ROWS ONLY");
         assertThat(offset.allowed()).as(offset.reason()).isTrue();
@@ -306,7 +306,7 @@ class SqlGuardTest {
         GuardResult union = guard.check(
                 "SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales FETCH FIRST 5000 ROWS ONLY");
         assertThat(union.allowed()).as(union.reason()).isTrue();
-        assertThat(union.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 1000").doesNotContain("FETCH");
+        assertThat(union.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 1001").doesNotContain("FETCH");
     }
 
     @Test
@@ -320,42 +320,42 @@ class SqlGuardTest {
     void addsLimitWhenMissing() {
         GuardResult r = guard.check("SELECT count(*) FROM dw.fact_sales");
         assertThat(r.allowed()).isTrue();
-        assertThat(r.safeSql()).contains("LIMIT 1000");
+        assertThat(r.safeSql()).contains("LIMIT 1001");
     }
 
     @Test
     void keepsSmallLimit() {
         GuardResult r = guard.check("SELECT * FROM dw.fact_sales LIMIT 5");
         assertThat(r.allowed()).isTrue();
-        assertThat(r.safeSql()).contains("LIMIT 5").doesNotContain("LIMIT 1000");
+        assertThat(r.safeSql()).contains("LIMIT 5").doesNotContain("LIMIT 1001");
     }
 
     @Test
     void capsLargeLimit() {
         GuardResult r = guard.check("SELECT * FROM dw.fact_sales LIMIT 50000");
         assertThat(r.allowed()).isTrue();
-        assertThat(r.safeSql()).contains("LIMIT 1000").doesNotContain("50000");
+        assertThat(r.safeSql()).contains("LIMIT 1001").doesNotContain("50000");
     }
 
     @Test
     void capsLimitAll() {
         GuardResult r = guard.check("SELECT * FROM dw.fact_sales LIMIT ALL");
         assertThat(r.allowed()).isTrue();
-        assertThat(r.safeSql()).contains("LIMIT 1000");
+        assertThat(r.safeSql()).contains("LIMIT 1001");
     }
 
     @Test
     void keepsOffsetWhenCapping() {
         GuardResult r = guard.check("SELECT * FROM dw.fact_sales LIMIT 5000 OFFSET 10");
         assertThat(r.allowed()).isTrue();
-        assertThat(r.safeSql()).contains("LIMIT 1000").contains("OFFSET 10");
+        assertThat(r.safeSql()).contains("LIMIT 1001").contains("OFFSET 10");
     }
 
     @Test
     void innerLimitDoesNotCountAsOuterLimit() {
         GuardResult r = guard.check("SELECT * FROM (SELECT * FROM dw.fact_sales LIMIT 5) s");
         assertThat(r.allowed()).isTrue();
-        assertThat(r.safeSql()).endsWith("LIMIT 1000");
+        assertThat(r.safeSql()).endsWith("LIMIT 1001");
     }
 
     @Test
@@ -363,7 +363,7 @@ class SqlGuardTest {
         GuardResult r = guard.check(
                 "WITH t AS (SELECT * FROM dw.fact_sales) SELECT count(*) FROM t");
         assertThat(r.allowed()).as(r.reason()).isTrue();
-        assertThat(r.safeSql()).contains("LIMIT 1000");
+        assertThat(r.safeSql()).contains("LIMIT 1001");
     }
 
     @Test
@@ -377,7 +377,7 @@ class SqlGuardTest {
         GuardResult r = guard.check(
                 "SELECT date_key FROM dw.dim_date UNION ALL SELECT date_key FROM dw.fact_sales");
         assertThat(r.allowed()).as(r.reason()).isTrue();
-        assertThat(r.safeSql()).endsWith("LIMIT 1000");
+        assertThat(r.safeSql()).endsWith("LIMIT 1001");
     }
 
     @Test
@@ -400,7 +400,7 @@ class SqlGuardTest {
         for (String q : queries) {
             GuardResult r = guard.check(q);
             assertThat(r.allowed()).as("%s -> %s", q, r.reason()).isTrue();
-            assertThat(r.safeSql()).contains("LIMIT 1000");
+            assertThat(r.safeSql()).contains("LIMIT 1001");
         }
     }
 
