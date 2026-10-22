@@ -1,0 +1,547 @@
+# Review package: 78dab1c..HEAD
+
+## Commits
+2dfcad5 fix(guardrail): fail-closed lexer, AST keyword columns, TABLE and FETCH handling
+
+## Files changed
+ .../com/fsoft/training/guardrail/SqlGuard.java     | 169 +++++++++++++++++----
+ .../com/fsoft/training/guardrail/SqlGuardTest.java |  87 +++++++++++
+ 2 files changed, 224 insertions(+), 32 deletions(-)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/guardrail/SqlGuard.java b/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
+index 2002b0c..203e962 100644
+--- a/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
++++ b/src/main/java/com/fsoft/training/guardrail/SqlGuard.java
+@@ -18,34 +18,37 @@ import net.sf.jsqlparser.expression.JsonExpression;
+ import net.sf.jsqlparser.expression.JsonFunction;
+ import net.sf.jsqlparser.expression.JsonFunctionExpression;
+ import net.sf.jsqlparser.expression.JsonKeyValuePair;
+ import net.sf.jsqlparser.expression.LongValue;
+ import net.sf.jsqlparser.expression.WindowDefinition;
+ import net.sf.jsqlparser.expression.WindowElement;
+ import net.sf.jsqlparser.expression.WindowOffset;
+ import net.sf.jsqlparser.expression.operators.relational.IsDistinctExpression;
+ import net.sf.jsqlparser.expression.operators.relational.JsonOperator;
+ import net.sf.jsqlparser.parser.CCJSqlParserUtil;
++import net.sf.jsqlparser.schema.Column;
+ import net.sf.jsqlparser.schema.Table;
+ import net.sf.jsqlparser.statement.Statement;
+ import net.sf.jsqlparser.statement.Statements;
+ import net.sf.jsqlparser.statement.select.FromItemVisitor;
+ import net.sf.jsqlparser.statement.select.Join;
+ import net.sf.jsqlparser.statement.select.Limit;
+ import net.sf.jsqlparser.statement.select.ParenthesedFromItem;
+ import net.sf.jsqlparser.statement.select.ParenthesedSelect;
+ import net.sf.jsqlparser.statement.select.OrderByElement;
+ import net.sf.jsqlparser.statement.select.PlainSelect;
+ import net.sf.jsqlparser.statement.select.Select;
+ import net.sf.jsqlparser.statement.select.SelectVisitor;
+ import net.sf.jsqlparser.statement.select.SetOperationList;
++import net.sf.jsqlparser.statement.select.Fetch;
+ import net.sf.jsqlparser.statement.select.TableFunction;
++import net.sf.jsqlparser.statement.select.TableStatement;
+ import net.sf.jsqlparser.statement.select.WithItem;
+ import net.sf.jsqlparser.util.deparser.ExpressionDeParser;
+ import net.sf.jsqlparser.util.deparser.SelectDeParser;
+ 
+ import org.springframework.stereotype.Component;
+ 
+ /**
+  * AST-based guardrail: only a single SELECT over schema {@code dw} may pass.
+  * SQL produced by an LLM must go through {@link #check(String)} before execution.
+  */
+@@ -55,25 +58,28 @@ public class SqlGuard {
+     public static final int MAX_ROWS = 1000;
+ 
+     private static final String ALLOWED_SCHEMA = "dw";
+ 
+     /** Exact names blocked in addition to the prefix/infix families in {@link #isBlockedFunction}. */
+     private static final Set<String> BLOCKED_FUNCTIONS = Set.of(
+             "current_setting", "set_config", "nextval", "setval", "currval", "lastval",
+             "txid_current", "version", "current_user", "session_user",
+             "inet_server_addr", "inet_server_port",
+             "has_table_privilege", "has_schema_privilege", "has_database_privilege",
+-            "to_regclass", "xmlparse", "ts_stat", "ts_rewrite");
++            "to_regclass", "xmlparse", "ts_stat", "ts_rewrite",
++            "getpgusername", "current_database", "current_schemas", "inet_client_addr",
++            "inet_client_port", "current_query");
+ 
+     /** Keyword forms that the parser reads as plain columns but that expose session information. */
+     private static final Set<String> KEYWORD_COLUMNS = Set.of(
+-            "current_user", "session_user", "user", "current_role", "current_schema", "current_catalog");
++            "current_user", "session_user", "system_user", "user", "current_role", "current_schema",
++            "current_catalog");
+ 
+     private static final List<String> BLOCKED_PREFIXES = List.of(
+             "pg_", "lo_", "dblink",
+             "query_to_", "table_to_", "cursor_to_", "schema_to_", "database_to_");
+ 
+     public GuardResult check(String sql) {
+         if (sql == null || sql.isBlank()) {
+             return GuardResult.blocked("SQL rỗng, không có gì để chạy.");
+         }
+         Statements statements;
+@@ -90,20 +96,27 @@ public class SqlGuard {
+             return GuardResult.blocked("Chỉ cho phép câu lệnh SELECT (đọc dữ liệu), không cho phép "
+                     + statement.getClass().getSimpleName().toUpperCase(Locale.ROOT) + ".");
+         }
+ 
+         Inspector inspector = new Inspector();
+         try {
+             inspector.walk(select);
+         } catch (RuntimeException e) {
+             return GuardResult.blocked("SQL không hợp lệ: không kiểm tra được cấu trúc câu lệnh.");
+         }
++        if (inspector.tableStatement) {
++            return GuardResult.blocked("Câu lệnh TABLE không được hỗ trợ, hãy dùng SELECT ... FROM dw.<tên bảng>.");
++        }
++        if (inspector.keywordColumn != null) {
++            return GuardResult.blocked("Từ khóa '" + inspector.keywordColumn
++                    + "' tiết lộ thông tin phiên làm việc, không được phép.");
++        }
+         if (inspector.nonSelectCte != null) {
+             return GuardResult.blocked("CTE '" + inspector.nonSelectCte
+                     + "' không phải câu lệnh SELECT, chỉ cho phép SELECT.");
+         }
+         for (Table table : inspector.tables) {
+             if (!isAllowedTable(table)) {
+                 return GuardResult.blocked("Bảng '" + table.getFullyQualifiedName()
+                         + "' không được phép: chỉ được truy vấn bảng thuộc schema dw (ví dụ dw.fact_sales).");
+             }
+         }
+@@ -114,137 +127,211 @@ public class SqlGuard {
+         }
+         if (inspector.hasInto) {
+             return GuardResult.blocked("SELECT ... INTO không được phép (sẽ tạo bảng mới).");
+         }
+         if (inspector.hasLocking || select.getForMode() != null || select.getForUpdateTable() != null) {
+             return GuardResult.blocked("FOR UPDATE/SHARE không được phép (khóa dữ liệu).");
+         }
+ 
+         applyLimit(select);
+         String safeSql = select.toString();
+-        Optional<String> backstop = lexicalBackstop(safeSql);
++        Optional<String> backstop = lexicalBackstop(sql);
++        if (backstop.isEmpty()) {
++            backstop = lexicalBackstop(safeSql);
++        }
+         if (backstop.isPresent()) {
+             return GuardResult.blocked(backstop.get());
+         }
+         return GuardResult.allowed(safeSql);
+     }
+ 
+     /** @param name unquoted, lowercased, schema-stripped function name */
+     public static boolean isBlockedFunction(String name) {
+         if (BLOCKED_FUNCTIONS.contains(name) || name.contains("_to_xml")) {
+             return true;
+         }
+         return BLOCKED_PREFIXES.stream().anyMatch(name::startsWith);
+     }
+ 
++    private static final String DOLLAR_REASON = "Không hỗ trợ chuỗi dollar-quoted ($$), hãy dùng dấu nháy đơn '...'.";
++
+     /**
+-     * Fail-closed lexical layer over the deparsed SQL, independent of the AST walk: string literals are
+-     * skipped; identifiers (quoted or not) are checked for blocked function calls, pg_* / information_schema
+-     * names and session keyword columns.
++     * Fail-closed lexical layer over SQL text, independent of the AST walk. String literals (standard
++     * with '' escape, and E'...' with backslash escapes), comments and quoted identifiers are lexed
++     * properly; anything it cannot lex with certainty (unterminated string/comment/identifier, any
++     * '$' outside a string literal) is blocked. Outside literals it blocks blocked-function calls,
++     * pg_* / information_schema names and session keyword columns.
+      */
+     static Optional<String> lexicalBackstop(String sql) {
+         int n = sql.length();
+         int i = 0;
+         char prev = ' ';
+         while (i < n) {
+             char c = sql.charAt(i);
+             if (c == '\'') {
+-                i++;
+-                while (i < n) {
+-                    if (sql.charAt(i) == '\'') {
+-                        if (i + 1 < n && sql.charAt(i + 1) == '\'') {
+-                            i += 2;
+-                            continue;
+-                        }
+-                        break;
+-                    }
+-                    i++;
++                i = skipString(sql, i, false);
++                if (i < 0) {
++                    return Optional.of(UNTERMINATED_REASON);
+                 }
+-                i++;
+                 prev = '\'';
+                 continue;
+             }
++            if (c == '$') {
++                return Optional.of(DOLLAR_REASON);
++            }
++            if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
++                while (i < n && sql.charAt(i) != '\n') {
++                    i++;
++                }
++                continue;
++            }
++            if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
++                int end = sql.indexOf("*/", i + 2);
++                if (end < 0) {
++                    return Optional.of(UNTERMINATED_REASON);
++                }
++                i = end + 2;
++                continue;
++            }
+             boolean quoted = c == '"';
+             if (quoted || Character.isLetter(c) || c == '_') {
+                 int start = quoted ? i + 1 : i;
+                 int j = start;
+                 if (quoted) {
+-                    while (j < n && sql.charAt(j) != '"') {
+-                        j++;
++                    while (j < n && !(sql.charAt(j) == '"'
++                            && !(j + 1 < n && sql.charAt(j + 1) == '"'))) {
++                        j += sql.charAt(j) == '"' ? 2 : 1;
++                    }
++                    if (j >= n) {
++                        return Optional.of(UNTERMINATED_REASON);
+                     }
+                 } else {
+-                    while (j < n && (Character.isLetterOrDigit(sql.charAt(j)) || sql.charAt(j) == '_'
+-                            || sql.charAt(j) == '$')) {
++                    while (j < n && (Character.isLetterOrDigit(sql.charAt(j)) || sql.charAt(j) == '_')) {
+                         j++;
+                     }
+                 }
+                 String name = sql.substring(start, j).toLowerCase(Locale.ROOT);
+                 i = quoted ? j + 1 : j;
++                if (!quoted && name.equals("e") && i < n && sql.charAt(i) == '\'') {
++                    i = skipString(sql, i, true);
++                    if (i < 0) {
++                        return Optional.of(UNTERMINATED_REASON);
++                    }
++                    prev = '\'';
++                    continue;
++                }
+                 int k = i;
+                 while (k < n && Character.isWhitespace(sql.charAt(k))) {
+                     k++;
+                 }
+                 boolean call = k < n && sql.charAt(k) == '(';
+                 boolean qualified = prev == '.' || k < n && sql.charAt(k) == '.';
+                 if (call && isBlockedFunction(name)) {
+                     return Optional.of("Hàm '" + name + "' bị cấm vì lý do an toàn.");
+                 }
+                 if (name.startsWith("pg_") || name.equals("information_schema")) {
+                     return Optional.of("Tên '" + name + "' thuộc catalog hệ thống, không được phép truy vấn.");
+                 }
+                 if (!quoted && !qualified && KEYWORD_COLUMNS.contains(name)) {
+                     return Optional.of("Từ khóa '" + name + "' tiết lộ thông tin phiên làm việc, không được phép.");
+                 }
+                 prev = 'a';
+                 continue;
+             }
++            if (Character.isDigit(c)) {
++                while (i < n && (Character.isLetterOrDigit(sql.charAt(i)) || sql.charAt(i) == '_')) {
++                    i++;
++                }
++                prev = '0';
++                continue;
++            }
+             if (!Character.isWhitespace(c)) {
+                 prev = c;
+             }
+             i++;
+         }
+         return Optional.empty();
+     }
+ 
++    private static final String UNTERMINATED_REASON = "SQL không hợp lệ: chuỗi hoặc chú thích không được đóng.";
++
++    /** @return index just after the closing quote, or -1 if the literal is unterminated */
++    private static int skipString(String sql, int openQuote, boolean backslashEscapes) {
++        int n = sql.length();
++        int i = openQuote + 1;
++        while (i < n) {
++            char ch = sql.charAt(i);
++            if (backslashEscapes && ch == '\\') {
++                i += 2;
++                continue;
++            }
++            if (ch == '\'') {
++                if (i + 1 < n && sql.charAt(i + 1) == '\'') {
++                    i += 2;
++                    continue;
++                }
++                return i + 1;
++            }
++            i++;
++        }
++        return -1;
++    }
++
+     private static boolean isAllowedTable(Table table) {
+         // Exactly schema.table; a database part (db.schema.table) or missing schema is rejected.
+         if (table.getDatabase() != null && table.getDatabase().getDatabaseName() != null) {
+             return false;
+         }
+         return table.getSchemaName() != null && ALLOWED_SCHEMA.equals(fold(table.getSchemaName()));
+     }
+ 
+     private static void applyLimit(Select select) {
+-        // JSqlParser attaches a trailing "UNION ... LIMIT n" to the last (unparenthesized) branch; in
+-        // Postgres that LIMIT applies to the whole set operation, so treat it as the outermost one.
++        // JSqlParser attaches a trailing "UNION ... LIMIT n" / FETCH to the last (unparenthesized)
++        // branch; in Postgres it applies to the whole set operation, so treat it as the outermost one.
+         Select holder = select;
+-        if (select instanceof SetOperationList union && union.getLimit() == null
++        if (select instanceof SetOperationList union && union.getLimit() == null && union.getFetch() == null
+                 && union.getSelects() != null && !union.getSelects().isEmpty()) {
+             Select last = union.getSelects().get(union.getSelects().size() - 1);
+-            if (last instanceof PlainSelect && last.getLimit() != null) {
++            if (last instanceof PlainSelect && (last.getLimit() != null || last.getFetch() != null)) {
+                 holder = last;
+             }
+         }
++        long cap = MAX_ROWS;
+         Limit limit = holder.getLimit();
++        if (limit != null && limit.getRowCount() instanceof LongValue rows) {
++            cap = Math.min(cap, rows.getValue());
++        }
++        Fetch fetch = holder.getFetch();
++        if (fetch != null) {
++            cap = Math.min(cap, fetchRows(fetch));
++            holder.setFetch(null);
++        }
+         if (limit == null) {
+             limit = new Limit();
+-            limit.setRowCount(new LongValue(MAX_ROWS));
+             holder.setLimit(limit);
+-            return;
+-        }
+-        if (limit.getRowCount() instanceof LongValue rows && rows.getValue() <= MAX_ROWS) {
+-            return;
+         }
+-        // Too large, LIMIT ALL / NULL, or an expression we cannot prove is <= MAX_ROWS.
++        // Over the cap, LIMIT ALL / NULL, or an expression we cannot prove is <= MAX_ROWS: use the cap.
+         limit.setLimitAll(false);
+         limit.setLimitNull(false);
+-        limit.setRowCount(new LongValue(MAX_ROWS));
++        limit.setRowCount(new LongValue(cap));
++    }
++
++    /** Row count of FETCH FIRST n ROWS ONLY; anything else (WITH TIES, expression) counts as MAX_ROWS. */
++    private static long fetchRows(Fetch fetch) {
++        if (fetch.toString().toUpperCase(Locale.ROOT).contains("TIES")) {
++            return MAX_ROWS;
++        }
++        if (fetch.getExpression() instanceof LongValue rows) {
++            return rows.getValue();
++        }
++        return fetch.getExpression() == null && fetch.getFetchJdbcParameter() == null
++                ? fetch.getRowCount() : MAX_ROWS;
+     }
+ 
+     /** Postgres folding: unquoted identifiers lowercase, quoted ones compare exactly. */
+     static String fold(String identifier) {
+         String n = identifier.strip();
+         if (n.length() >= 2 && n.startsWith("\"") && n.endsWith("\"")) {
+             return n.substring(1, n.length() - 1).replace("\"\"", "\"");
+         }
+         return n.toLowerCase(Locale.ROOT);
+     }
+@@ -264,20 +351,22 @@ public class SqlGuard {
+      * Walks every node of the statement via the deparser visitors (which must visit every clause to
+      * print it), tracking Postgres CTE scoping: a non-recursive WITH item sees only earlier siblings,
+      * WITH RECURSIVE also sees itself, and CTEs of a nested SELECT do not leak outward.
+      */
+     private static final class Inspector {
+         final List<Table> tables = new ArrayList<>();
+         final List<String> functions = new ArrayList<>();
+         String nonSelectCte;
+         boolean hasInto;
+         boolean hasLocking;
++        boolean tableStatement;
++        String keywordColumn;
+         private final Deque<Scope> scopes = new ArrayDeque<>();
+ 
+         private static final class Scope {
+             final Set<String> names = new HashSet<>();
+             final boolean recursive;
+ 
+             Scope(boolean recursive) {
+                 this.recursive = recursive;
+             }
+         }
+@@ -363,20 +452,30 @@ public class SqlGuard {
+             HookedExpressionDeParser(SelectVisitor<StringBuilder> selectVisitor, StringBuilder sb) {
+                 super(selectVisitor, sb);
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(Function function, S context) {
+                 record(function.getName());
+                 return super.visit(function, context);
+             }
+ 
++            @Override
++            public <S> StringBuilder visit(Column column, S context) {
++                String name = column.getColumnName();
++                if (column.getTable() == null && name != null && !name.startsWith("\"")
++                        && KEYWORD_COLUMNS.contains(name.toLowerCase(Locale.ROOT))) {
++                    keywordColumn = name.toLowerCase(Locale.ROOT);
++                }
++                return super.visit(column, context);
++            }
++
+             @Override
+             public <S> StringBuilder visit(IsDistinctExpression expr, S context) {
+                 walkExpression(expr.getLeftExpression());
+                 walkExpression(expr.getRightExpression());
+                 return super.visit(expr, context);
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(JsonOperator expr, S context) {
+                 walkExpression(expr.getLeftExpression());
+@@ -439,20 +538,26 @@ public class SqlGuard {
+             }
+ 
+             @Override
+             public <S> StringBuilder visit(Table table, S context) {
+                 if (!isVisibleCte(table)) {
+                     tables.add(table);
+                 }
+                 return super.visit(table, context);
+             }
+ 
++            @Override
++            public <S> StringBuilder visit(TableStatement table, S context) {
++                tableStatement = true;
++                return super.visit(table, context);
++            }
++
+             @Override
+             public <S> StringBuilder visit(ParenthesedFromItem item, S context) {
+                 // The deparser prints the joins inside the parentheses as text; walk them here.
+                 if (item.getJoins() != null) {
+                     for (Join join : item.getJoins()) {
+                         join.getRightItem().accept((FromItemVisitor<StringBuilder>) this, null);
+                         if (join.getOnExpressions() != null) {
+                             for (Expression on : join.getOnExpressions()) {
+                                 on.accept(expressions, null);
+                             }
+diff --git a/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java b/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
+index 8cf6642..37638a5 100644
+--- a/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
++++ b/src/test/java/com/fsoft/training/guardrail/SqlGuardTest.java
+@@ -215,20 +215,107 @@ class SqlGuardTest {
+         assertThat(SqlGuard.lexicalBackstop("SELECT 'it''s pg_sleep(1)', px FROM dw.dim_date")).isEmpty();
+     }
+ 
+     @Test
+     void blockedFunctionPredicateIsPublicAndCoversFamilies() {
+         assertThat(SqlGuard.isBlockedFunction("pg_sleep")).isTrue();
+         assertThat(SqlGuard.isBlockedFunction("ts_stat")).isTrue();
+         assertThat(SqlGuard.isBlockedFunction("sum")).isFalse();
+     }
+ 
++    @ParameterizedTest
++    @ValueSource(strings = {
++            // 1/2. dollar-quote desync and keyword columns hidden behind it
++            "SELECT $$'$$, pg_sleep(1), $$'$$",
++            "SELECT $$'$$, session_user, $$'$$",
++            "SELECT $$'$$, user, current_role, current_schema, current_catalog, $$'$$",
++            "SELECT $$'$$ || current_user || $$'$$ AS who FROM dw.dim_date",
++            "SELECT * FROM dw.dim_date WHERE $$'$$ <> current_user OR $$'$$ = ''",
++            "SELECT $tag$x$tag$ FROM dw.dim_date",
++            "SELECT system_user",
++            // keyword columns enforced in the AST as well
++            "SELECT * FROM dw.dim_date WHERE 'x' <> current_user",
++            "SELECT session_user FROM dw.dim_date",
++            // 3. TABLE statement
++            "TABLE app.users",
++            "TABLE dw.dim_date",
++            // 4. session-info functions
++            "SELECT getpgusername()",
++            "SELECT current_database()",
++            "SELECT current_schemas(true)",
++            "SELECT inet_client_addr()",
++            "SELECT inet_client_port()",
++            "SELECT current_query()"
++    })
++    void blocksRound3Bypasses(String sql) {
++        GuardResult r = guard.check(sql);
++        assertThat(r.allowed()).as(sql).isFalse();
++        assertThat(r.reason()).isNotBlank();
++    }
++
++    @Test
++    void dollarQuotingGivesSpecificReason() {
++        assertThat(guard.check("SELECT $$x$$ FROM dw.dim_date").reason()).contains("dollar");
++    }
++
++    @Test
++    void lexerFailsClosedOnUnterminatedString() {
++        assertThat(SqlGuard.lexicalBackstop("SELECT 'abc")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT $$'$$, pg_sleep(1), $$'$$")).isPresent();
++    }
++
++    @Test
++    void lexerHandlesEscapeStrings() {
++        assertThat(SqlGuard.lexicalBackstop("SELECT E'it\\'s pg_sleep(1)'")).isEmpty();
++        assertThat(SqlGuard.lexicalBackstop("SELECT E'\\'', pg_sleep(1)")).isPresent();
++        assertThat(SqlGuard.lexicalBackstop("SELECT 'a''b', pg_sleep(1)")).isPresent();
++    }
++
++    @Test
++    void literalsWithSuspiciousTextStillPass() {
++        String[] queries = {
++                "SELECT 'pg_sleep(1)' AS a FROM dw.dim_date",
++                "SELECT 'DROP TABLE x', 'current_user', 'O''Reilly', 'a $ b' FROM dw.dim_date",
++                "SELECT * FROM dw.dim_artist WHERE name = 'O''Reilly'",
++                "SELECT E'abc pg_sleep(1)' FROM dw.dim_date",
++                "SELECT d.current_user_x FROM dw.dim_date d"
++        };
++        for (String q : queries) {
++            GuardResult r = guard.check(q);
++            assertThat(r.allowed()).as("%s -> %s", q, r.reason()).isTrue();
++        }
++    }
++
++    @Test
++    void fetchFirstBecomesCappedLimit() {
++        GuardResult small = guard.check("SELECT * FROM dw.fact_sales FETCH FIRST 10 ROWS ONLY");
++        assertThat(small.allowed()).as(small.reason()).isTrue();
++        assertThat(small.safeSql()).contains("LIMIT 10").doesNotContain("FETCH").doesNotContain("1000");
++
++        GuardResult big = guard.check("SELECT * FROM dw.fact_sales FETCH FIRST 5000 ROWS ONLY");
++        assertThat(big.allowed()).as(big.reason()).isTrue();
++        assertThat(big.safeSql()).contains("LIMIT 1000").doesNotContain("FETCH").doesNotContain("5000");
++
++        GuardResult ties = guard.check("SELECT * FROM dw.fact_sales ORDER BY sales_key FETCH FIRST 5 ROWS WITH TIES");
++        assertThat(ties.allowed()).as(ties.reason()).isTrue();
++        assertThat(ties.safeSql()).contains("LIMIT 1000").doesNotContain("FETCH").doesNotContain("TIES");
++
++        GuardResult offset = guard.check("SELECT * FROM dw.fact_sales OFFSET 3 ROWS FETCH NEXT 7 ROWS ONLY");
++        assertThat(offset.allowed()).as(offset.reason()).isTrue();
++        assertThat(offset.safeSql()).contains("LIMIT 7").contains("OFFSET 3").doesNotContain("FETCH");
++
++        GuardResult union = guard.check(
++                "SELECT date_key FROM dw.dim_date UNION SELECT date_key FROM dw.fact_sales FETCH FIRST 5000 ROWS ONLY");
++        assertThat(union.allowed()).as(union.reason()).isTrue();
++        assertThat(union.safeSql()).containsOnlyOnce("LIMIT").contains("LIMIT 1000").doesNotContain("FETCH");
++    }
++
+     @Test
+     void reasonNamesOffendingTableAndFunction() {
+         assertThat(guard.check("SELECT * FROM app.users").reason()).contains("app.users");
+         assertThat(guard.check("SELECT * FROM fact_sales").reason()).contains("fact_sales");
+         assertThat(guard.check("SELECT PG_SLEEP(1)").reason()).contains("pg_sleep");
+     }
+ 
+     @Test
+     void addsLimitWhenMissing() {
+         GuardResult r = guard.check("SELECT count(*) FROM dw.fact_sales");

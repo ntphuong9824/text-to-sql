@@ -1,0 +1,336 @@
+# Review package: aa72487..HEAD
+
+## Commits
+0e0c38d fix(auth): keep framework error statuses, ignore stale bearer on auth endpoints, narrow 409
+
+## Files changed
+ .../java/com/fsoft/training/auth/AuthDtos.java     |  3 +-
+ .../com/fsoft/training/auth/UserRepository.java    | 17 ++++++----
+ .../training/auth/UsernameTakenException.java      |  8 +++++
+ .../fsoft/training/config/ApiExceptionHandler.java | 24 +++++++++++--
+ .../com/fsoft/training/config/SecurityConfig.java  | 10 ++++++
+ .../java/com/fsoft/training/auth/AuthFlowTest.java | 39 +++++++++++++++++++---
+ .../com/fsoft/training/auth/TestMeController.java  | 18 ++++++++++
+ 7 files changed, 103 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/auth/AuthDtos.java b/src/main/java/com/fsoft/training/auth/AuthDtos.java
+index f7990c4..098c5a7 100644
+--- a/src/main/java/com/fsoft/training/auth/AuthDtos.java
++++ b/src/main/java/com/fsoft/training/auth/AuthDtos.java
+@@ -1,32 +1,31 @@
+ package com.fsoft.training.auth;
+ 
+ import jakarta.validation.constraints.AssertTrue;
+ import jakarta.validation.constraints.NotBlank;
+-import jakarta.validation.constraints.NotNull;
+ import jakarta.validation.constraints.Pattern;
+ import jakarta.validation.constraints.Size;
+ import java.nio.charset.StandardCharsets;
+ 
+ public final class AuthDtos {
+ 
+     static final int MAX_BCRYPT_BYTES = 72;
+ 
+     private AuthDtos() {
+     }
+ 
+     public record RegisterRequest(
+             @NotBlank(message = "Tên đăng nhập không được để trống")
+             @Size(min = 3, max = 50, message = "Tên đăng nhập phải từ 3 đến 50 ký tự")
+             @Pattern(regexp = "[a-zA-Z0-9_.]+", message = "Tên đăng nhập chỉ gồm chữ, số, dấu gạch dưới và dấu chấm")
+             String username,
+-            @NotNull(message = "Mật khẩu không được để trống")
++            @NotBlank(message = "Mật khẩu không được để trống")
+             @Size(min = 8, max = 100, message = "Mật khẩu phải từ 8 đến 100 ký tự")
+             String password) {
+ 
+         /** BCrypt only supports passwords up to 72 bytes and Spring rejects longer ones. */
+         @AssertTrue(message = "Mật khẩu quá dài (tối đa 72 byte)")
+         public boolean isPasswordWithinBcryptLimit() {
+             return password == null || password.getBytes(StandardCharsets.UTF_8).length <= MAX_BCRYPT_BYTES;
+         }
+     }
+ 
+diff --git a/src/main/java/com/fsoft/training/auth/UserRepository.java b/src/main/java/com/fsoft/training/auth/UserRepository.java
+index 2f37fd6..f1a1d07 100644
+--- a/src/main/java/com/fsoft/training/auth/UserRepository.java
++++ b/src/main/java/com/fsoft/training/auth/UserRepository.java
+@@ -1,13 +1,14 @@
+ package com.fsoft.training.auth;
+ 
+ import java.util.Optional;
++import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.jdbc.core.simple.JdbcClient;
+ import org.springframework.stereotype.Repository;
+ 
+ @Repository
+ public class UserRepository {
+ 
+     public record UserRow(long id, String username, String passwordHash) {
+     }
+ 
+     private final JdbcClient jdbc;
+@@ -17,19 +18,23 @@ public class UserRepository {
+     }
+ 
+     public Optional<UserRow> findByUsername(String username) {
+         return jdbc.sql("select id, username, password_hash from app.users where username = :username")
+                 .param("username", username)
+                 .query((rs, n) -> new UserRow(rs.getLong("id"), rs.getString("username"),
+                         rs.getString("password_hash")))
+                 .optional();
+     }
+ 
+-    /** @throws org.springframework.dao.DuplicateKeyException when the username is taken */
++    /** @throws UsernameTakenException when the username is taken */
+     public long create(String username, String passwordHash) {
+-        return jdbc.sql("insert into app.users(username, password_hash) values (:username, :hash) returning id")
+-                .param("username", username)
+-                .param("hash", passwordHash)
+-                .query(Long.class)
+-                .single();
++        try {
++            return jdbc.sql("insert into app.users(username, password_hash) values (:username, :hash) returning id")
++                    .param("username", username)
++                    .param("hash", passwordHash)
++                    .query(Long.class)
++                    .single();
++        } catch (DuplicateKeyException e) {
++            throw new UsernameTakenException(username);
++        }
+     }
+ }
+diff --git a/src/main/java/com/fsoft/training/auth/UsernameTakenException.java b/src/main/java/com/fsoft/training/auth/UsernameTakenException.java
+new file mode 100644
+index 0000000..ff3fa11
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/auth/UsernameTakenException.java
+@@ -0,0 +1,8 @@
++package com.fsoft.training.auth;
++
++public class UsernameTakenException extends RuntimeException {
++
++    public UsernameTakenException(String username) {
++        super("Username already taken: " + username);
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/config/ApiExceptionHandler.java b/src/main/java/com/fsoft/training/config/ApiExceptionHandler.java
+index 275061e..cf6e531 100644
+--- a/src/main/java/com/fsoft/training/config/ApiExceptionHandler.java
++++ b/src/main/java/com/fsoft/training/config/ApiExceptionHandler.java
+@@ -1,17 +1,18 @@
+ package com.fsoft.training.config;
+ 
+ import com.fsoft.training.auth.AuthDtos.ErrorResponse;
+ import java.util.stream.Collectors;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+-import org.springframework.dao.DuplicateKeyException;
++import com.fsoft.training.auth.UsernameTakenException;
++import org.springframework.http.HttpStatusCode;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.http.converter.HttpMessageNotReadableException;
+ import org.springframework.web.bind.MethodArgumentNotValidException;
+ import org.springframework.web.bind.annotation.ExceptionHandler;
+ import org.springframework.web.bind.annotation.RestControllerAdvice;
+ import org.springframework.web.method.annotation.HandlerMethodValidationException;
+ 
+ @RestControllerAdvice
+ public class ApiExceptionHandler {
+@@ -30,26 +31,43 @@ public class ApiExceptionHandler {
+     @ExceptionHandler(HandlerMethodValidationException.class)
+     ResponseEntity<ErrorResponse> onInvalidParameter(HandlerMethodValidationException ex) {
+         return badRequest("Dữ liệu không hợp lệ");
+     }
+ 
+     @ExceptionHandler(HttpMessageNotReadableException.class)
+     ResponseEntity<ErrorResponse> onUnreadable(HttpMessageNotReadableException ex) {
+         return badRequest("Nội dung yêu cầu không hợp lệ");
+     }
+ 
+-    @ExceptionHandler(DuplicateKeyException.class)
+-    ResponseEntity<ErrorResponse> onDuplicate(DuplicateKeyException ex) {
++    @ExceptionHandler(UsernameTakenException.class)
++    ResponseEntity<ErrorResponse> onUsernameTaken(UsernameTakenException ex) {
+         return ResponseEntity.status(HttpStatus.CONFLICT).body(new ErrorResponse("Tên đăng nhập đã tồn tại"));
+     }
+ 
++    private static String messageFor(HttpStatusCode status) {
++        return switch (status.value()) {
++            case 400 -> "Yêu cầu không hợp lệ";
++            case 404 -> "Không tìm thấy";
++            case 405 -> "Phương thức không được hỗ trợ";
++            case 415 -> "Định dạng nội dung không được hỗ trợ";
++            default -> status.is5xxServerError()
++                    ? "Đã xảy ra lỗi hệ thống, vui lòng thử lại sau" : "Yêu cầu không thể xử lý";
++        };
++    }
++
+     @ExceptionHandler(Exception.class)
+     ResponseEntity<ErrorResponse> onUnexpected(Exception ex) {
++        // Spring MVC exceptions (404, 405, 415, 400...) implement ErrorResponse and carry their own status.
++        if (ex instanceof org.springframework.web.ErrorResponse withStatus) {
++            HttpStatusCode status = withStatus.getStatusCode();
++            log.debug("Request failed with status {}", status, ex);
++            return ResponseEntity.status(status).body(new ErrorResponse(messageFor(status)));
++        }
+         log.error("Unexpected error", ex);
+         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                 .body(new ErrorResponse("Đã xảy ra lỗi hệ thống, vui lòng thử lại sau"));
+     }
+ 
+     private static ResponseEntity<ErrorResponse> badRequest(String message) {
+         return ResponseEntity.badRequest().body(new ErrorResponse(message));
+     }
+ }
+diff --git a/src/main/java/com/fsoft/training/config/SecurityConfig.java b/src/main/java/com/fsoft/training/config/SecurityConfig.java
+index 8bb37e9..de4d8af 100644
+--- a/src/main/java/com/fsoft/training/config/SecurityConfig.java
++++ b/src/main/java/com/fsoft/training/config/SecurityConfig.java
+@@ -15,20 +15,22 @@ import org.springframework.security.config.Customizer;
+ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+ import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+ import org.springframework.security.config.http.SessionCreationPolicy;
+ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+ import org.springframework.security.oauth2.jwt.JwtDecoder;
+ import org.springframework.security.oauth2.jwt.JwtEncoder;
+ import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
++import org.springframework.security.oauth2.server.resource.web.BearerTokenResolver;
++import org.springframework.security.oauth2.server.resource.web.DefaultBearerTokenResolver;
+ import org.springframework.security.web.AuthenticationEntryPoint;
+ import org.springframework.security.web.SecurityFilterChain;
+ import org.springframework.web.cors.CorsConfiguration;
+ import org.springframework.web.cors.CorsConfigurationSource;
+ import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+ import tools.jackson.databind.ObjectMapper;
+ 
+ @Configuration
+ public class SecurityConfig {
+ 
+@@ -42,25 +44,33 @@ public class SecurityConfig {
+         };
+         http.csrf(AbstractHttpConfigurer::disable)
+                 .cors(Customizer.withDefaults())
+                 .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                 .authorizeHttpRequests(a -> a
+                         .requestMatchers("/api/auth/**").permitAll()
+                         .requestMatchers("/api/**").authenticated()
+                         .anyRequest().denyAll())
+                 .oauth2ResourceServer(o -> o
+                         .authenticationEntryPoint(unauthorized)
++                        .bearerTokenResolver(bearerTokenResolver())
+                         .jwt(Customizer.withDefaults()))
+                 .exceptionHandling(e -> e.authenticationEntryPoint(unauthorized));
+         return http.build();
+     }
+ 
++    /** Ignores any Authorization header on /api/auth/**, so a stale token cannot block logging in again. */
++    private static BearerTokenResolver bearerTokenResolver() {
++        DefaultBearerTokenResolver delegate = new DefaultBearerTokenResolver();
++        return request -> request.getRequestURI().startsWith(request.getContextPath() + "/api/auth/")
++                ? null : delegate.resolve(request);
++    }
++
+     @Bean
+     CorsConfigurationSource corsConfigurationSource(
+             @Value("${app.cors.allowed-origins}") List<String> allowedOrigins) {
+         CorsConfiguration config = new CorsConfiguration();
+         config.setAllowedOrigins(allowedOrigins);
+         config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+         config.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+         source.registerCorsConfiguration("/api/**", config);
+         return source;
+diff --git a/src/test/java/com/fsoft/training/auth/AuthFlowTest.java b/src/test/java/com/fsoft/training/auth/AuthFlowTest.java
+index 26bc566..b83192a 100644
+--- a/src/test/java/com/fsoft/training/auth/AuthFlowTest.java
++++ b/src/test/java/com/fsoft/training/auth/AuthFlowTest.java
+@@ -95,25 +95,54 @@ class AuthFlowTest extends PostgresIntegrationTest {
+         String valid = token(Duration.ofHours(1));
+         String tampered = valid.substring(0, valid.length() - 4) + (valid.endsWith("AAAA") ? "BBBB" : "AAAA");
+         mvc.perform(get("/api/conversations").header("Authorization", "Bearer " + tampered))
+                 .andExpect(status().isUnauthorized());
+ 
+         mvc.perform(get("/api/conversations").header("Authorization", "Bearer " + token(Duration.ofMinutes(-10))))
+                 .andExpect(status().isUnauthorized());
+     }
+ 
+     @Test
+-    void validTokenPassesSecurity() throws Exception {
+-        // No /api/conversations controller yet: anything but 401 proves Security let the request through.
+-        int status = mvc.perform(get("/api/conversations").header("Authorization", "Bearer " + token(Duration.ofHours(1))))
+-                .andReturn().getResponse().getStatus();
+-        assertThat(status).isNotEqualTo(401);
++    void validTokenReachesControllerAndResolvesCurrentUser() throws Exception {
++        mvc.perform(get("/api/test/me").header("Authorization", "Bearer " + token(Duration.ofHours(1))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.id").value(1))
++                .andExpect(jsonPath("$.username").value("x"));
++    }
++
++    @Test
++    void frameworkErrorsKeepTheirStatus() throws Exception {
++        String auth = "Bearer " + token(Duration.ofHours(1));
++        mvc.perform(get("/api/does-not-exist").header("Authorization", auth))
++                .andExpect(status().isNotFound())
++                .andExpect(jsonPath("$.message").value("Không tìm thấy"));
++        mvc.perform(get("/api/auth/login").header("Authorization", auth))
++                .andExpect(status().isMethodNotAllowed())
++                .andExpect(jsonPath("$.message").value("Phương thức không được hỗ trợ"));
++        mvc.perform(post("/api/auth/login").contentType(MediaType.TEXT_PLAIN).content("x").header("Authorization", auth))
++                .andExpect(status().isUnsupportedMediaType());
++    }
++
++    @Test
++    void staleBearerTokenDoesNotBlockAuthEndpoints() throws Exception {
++        register("frank", "password1", 201);
++        mvc.perform(post("/api/auth/login").header("Authorization", "Bearer x")
++                        .contentType(MediaType.APPLICATION_JSON).content(body("frank", "password1")))
++                .andExpect(status().isOk());
++        mvc.perform(post("/api/auth/login").header("Authorization", "Bearer " + token(Duration.ofMinutes(-10)))
++                        .contentType(MediaType.APPLICATION_JSON).content(body("frank", "password1")))
++                .andExpect(status().isOk());
++    }
++
++    @Test
++    void blankPasswordIsRejectedOnRegister() throws Exception {
++        register("gina", "        ", 400);
+     }
+ 
+     @Test
+     void passwordIsStoredAsBcrypt() throws Exception {
+         register("erin", "s3cret-pass", 201);
+         String hash = appJdbc.queryForObject("select password_hash from app.users where username = 'erin'", String.class);
+         assertThat(hash).startsWith("$2").doesNotContain("s3cret-pass");
+     }
+ 
+     @Test
+diff --git a/src/test/java/com/fsoft/training/auth/TestMeController.java b/src/test/java/com/fsoft/training/auth/TestMeController.java
+new file mode 100644
+index 0000000..ed2f800
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/auth/TestMeController.java
+@@ -0,0 +1,18 @@
++package com.fsoft.training.auth;
++
++import java.util.Map;
++import org.springframework.security.core.Authentication;
++import org.springframework.security.oauth2.jwt.Jwt;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/** Test-only endpoint proving a valid token reaches a controller and CurrentUser resolves the id. */
++@RestController
++class TestMeController {
++
++    @GetMapping("/api/test/me")
++    Map<String, Object> me(Authentication authentication) {
++        return Map.of("id", CurrentUser.id(authentication),
++                "username", ((Jwt) authentication.getPrincipal()).getClaimAsString("username"));
++    }
++}

@@ -1,0 +1,307 @@
+# Review package: 6a5c2af..HEAD
+
+## Commits
+71b2599 fix(nl2sql): classify infra failures, catch unexpected errors, harden fence extraction
+
+## Files changed
+ .../com/fsoft/training/nl2sql/Nl2SqlPipeline.java  | 40 ++++++++++
+ .../com/fsoft/training/nl2sql/SqlExtractor.java    |  9 ++-
+ .../nl2sql/Nl2SqlPipelineRobustnessTest.java       | 90 ++++++++++++++++++++++
+ .../fsoft/training/nl2sql/SqlExtractorTest.java    | 16 ++++
+ 4 files changed, 154 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/nl2sql/Nl2SqlPipeline.java b/src/main/java/com/fsoft/training/nl2sql/Nl2SqlPipeline.java
+index 2dfdcaf..0b82944 100644
+--- a/src/main/java/com/fsoft/training/nl2sql/Nl2SqlPipeline.java
++++ b/src/main/java/com/fsoft/training/nl2sql/Nl2SqlPipeline.java
+@@ -3,31 +3,38 @@ package com.fsoft.training.nl2sql;
+ import com.fsoft.training.chart.ChartSuggester;
+ import com.fsoft.training.guardrail.GuardResult;
+ import com.fsoft.training.guardrail.SqlGuard;
+ import com.fsoft.training.llm.ChatMessage;
+ import com.fsoft.training.llm.LlmClient;
+ import com.fsoft.training.llm.LlmException;
+ import com.fsoft.training.warehouse.QueryResult;
+ import com.fsoft.training.warehouse.SqlExecutionException;
+ import com.fsoft.training.warehouse.SqlExecutor;
+ import com.fsoft.training.warehouse.SqlPolicyViolationException;
++import java.sql.SQLException;
+ import java.util.List;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.dao.QueryTimeoutException;
++import org.springframework.dao.TransientDataAccessResourceException;
++import org.springframework.jdbc.CannotGetJdbcConnectionException;
+ import org.springframework.stereotype.Service;
+ 
+ @Service
+ public class Nl2SqlPipeline {
+ 
+     private static final Logger log = LoggerFactory.getLogger(Nl2SqlPipeline.class);
+     static final int MAX_REPAIRS = 2;
+     static final int SHOTS = 4;
++    static final String GENERIC_ERROR = "Đã xảy ra lỗi khi xử lý câu hỏi, vui lòng thử lại";
++    static final String TIMEOUT_MESSAGE = "Truy vấn chạy quá lâu (quá 10 giây), hãy thu hẹp câu hỏi";
++    static final String CONNECTION_MESSAGE = "Không kết nối được cơ sở dữ liệu";
+ 
+     private final QuestionRewriter rewriter;
+     private final FewShotSelector shotSelector;
+     private final PromptBuilder prompts;
+     private final LlmClient llm;
+     private final SqlGuard guard;
+     private final SqlExecutor executor;
+     private final ChartSuggester chartSuggester;
+ 
+     public Nl2SqlPipeline(QuestionRewriter rewriter, FewShotSelector shotSelector, PromptBuilder prompts,
+@@ -75,38 +82,71 @@ public class Nl2SqlPipeline {
+                 try {
+                     QueryResult result = executor.execute(sql);
+                     outcome = new TurnOutcome(rewritten, sql, TurnStatus.OK, "OK", result,
+                             chartSuggester.suggest(result));
+                     break;
+                 } catch (SqlPolicyViolationException e) {
+                     guardDecision = "policy-blocked";
+                     outcome = blocked(rewritten, sql, e.getMessage());
+                     break;
+                 } catch (SqlExecutionException e) {
++                    String infra = infrastructureMessage(e);
++                    if (infra != null) {
++                        outcome = new TurnOutcome(rewritten, sql, TurnStatus.ERROR, infra, null, null);
++                        break;
++                    }
+                     if (repairs >= MAX_REPAIRS) {
+                         outcome = new TurnOutcome(rewritten, sql, TurnStatus.ERROR,
+                                 "Không chạy được câu SQL sau " + MAX_REPAIRS + " lần sửa: " + e.getMessage(),
+                                 null, null);
+                         break;
+                     }
+                     repairs++;
+                     messages = prompts.buildFix(messages, sql, e.getMessage());
+                     raw = llm.complete(messages);
+                 }
+             }
+         } catch (LlmException e) {
+             outcome = new TurnOutcome(rewritten, sql, TurnStatus.ERROR, e.userMessage(), null, null);
++        } catch (RuntimeException e) {
++            log.warn("nl2sql turn failed unexpectedly", e);
++            outcome = new TurnOutcome(rewritten, sql, TurnStatus.ERROR, GENERIC_ERROR, null, null);
+         }
+         log.info("nl2sql turn: question=\"{}\" rewritten=\"{}\" sql=\"{}\" guard={} status={} repairs={} elapsedMs={}",
+                 oneLine(question), oneLine(rewritten), oneLine(outcome.sql()), guardDecision, outcome.status(),
+                 repairs, (System.nanoTime() - start) / 1_000_000);
+         return outcome;
+     }
+ 
++    /** Non-null for timeouts and connection failures, which a rewritten query cannot fix. */
++    private static String infrastructureMessage(SqlExecutionException e) {
++        boolean connection = false;
++        for (Throwable t = e.getCause(); t != null; t = t.getCause()) {
++            if (t instanceof QueryTimeoutException) {
++                return TIMEOUT_MESSAGE;
++            }
++            if (t instanceof CannotGetJdbcConnectionException || t instanceof TransientDataAccessResourceException) {
++                connection = true;
++            }
++            if (t instanceof SQLException sqlEx && sqlEx.getSQLState() != null) {
++                if ("57014".equals(sqlEx.getSQLState())) {
++                    return TIMEOUT_MESSAGE;
++                }
++                if (sqlEx.getSQLState().startsWith("08")) {
++                    connection = true;
++                }
++            }
++            if (t.getCause() == t) {
++                break;
++            }
++        }
++        return connection ? CONNECTION_MESSAGE : null;
++    }
++
+     private static TurnOutcome blocked(String rewritten, String sql, String reason) {
+         return new TurnOutcome(rewritten, sql, TurnStatus.BLOCKED, reason, null, null);
+     }
+ 
+     private static String oneLine(String s) {
+         return s == null ? "" : s.replaceAll("\\s+", " ");
+     }
+ }
+diff --git a/src/main/java/com/fsoft/training/nl2sql/SqlExtractor.java b/src/main/java/com/fsoft/training/nl2sql/SqlExtractor.java
+index 280d370..a91eabf 100644
+--- a/src/main/java/com/fsoft/training/nl2sql/SqlExtractor.java
++++ b/src/main/java/com/fsoft/training/nl2sql/SqlExtractor.java
+@@ -1,20 +1,22 @@
+ package com.fsoft.training.nl2sql;
+ 
+ import java.util.Optional;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+ /** Pulls a single SQL statement out of free-form LLM text. */
+ public final class SqlExtractor {
+ 
+-    private static final Pattern FENCE = Pattern.compile("```[a-zA-Z]*[ \\t]*\\R?(.*?)```", Pattern.DOTALL);
++    // A language tag counts only when a newline follows it, so "```SELECT a```" keeps "SELECT".
++    private static final Pattern FENCE = Pattern.compile("```(?:[\\w+-]*[ \\t]*\\R)?(.*?)```", Pattern.DOTALL);
++    private static final Pattern OPEN_FENCE = Pattern.compile("^```(?:[\\w+-]*[ \\t]*\\R)?");
+     private static final Pattern REFUSE = Pattern.compile("^\\s*--\\s*REFUSE\\s*:?\\s*(.*)$", Pattern.DOTALL);
+ 
+     private SqlExtractor() {}
+ 
+     /** Empty when the model refused; otherwise the SQL without code fence or trailing semicolons. */
+     public static Optional<String> extract(String llmText) {
+         String text = body(llmText);
+         if (REFUSE.matcher(text).matches()) {
+             return Optional.empty();
+         }
+@@ -29,17 +31,22 @@ public final class SqlExtractor {
+         }
+         String reason = m.group(1).strip();
+         return reason.isEmpty() ? "Yêu cầu bị từ chối." : reason;
+     }
+ 
+     private static String body(String llmText) {
+         String text = llmText == null ? "" : llmText.strip();
+         Matcher fence = FENCE.matcher(text);
+         if (fence.find()) {
+             text = fence.group(1).strip();
++        } else if (text.startsWith("```")) {
++            text = OPEN_FENCE.matcher(text).replaceFirst("").strip();
++            if (text.endsWith("```")) {
++                text = text.substring(0, text.length() - 3).strip();
++            }
+         }
+         while (text.endsWith(";")) {
+             text = text.substring(0, text.length() - 1).stripTrailing();
+         }
+         return text;
+     }
+ }
+diff --git a/src/test/java/com/fsoft/training/nl2sql/Nl2SqlPipelineRobustnessTest.java b/src/test/java/com/fsoft/training/nl2sql/Nl2SqlPipelineRobustnessTest.java
+new file mode 100644
+index 0000000..f69f1af
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/nl2sql/Nl2SqlPipelineRobustnessTest.java
+@@ -0,0 +1,90 @@
++package com.fsoft.training.nl2sql;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.ArgumentMatchers.anyList;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import com.fsoft.training.chart.ChartSuggester;
++import com.fsoft.training.guardrail.GuardResult;
++import com.fsoft.training.guardrail.SqlGuard;
++import com.fsoft.training.llm.LlmClient;
++import com.fsoft.training.warehouse.SqlExecutionException;
++import com.fsoft.training.warehouse.SqlExecutor;
++import java.sql.SQLException;
++import java.util.List;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.dao.DataAccessResourceFailureException;
++import org.springframework.dao.QueryTimeoutException;
++import org.springframework.jdbc.UncategorizedSQLException;
++
++/** Pure unit tests (mocked collaborators) for failure classification in the pipeline. */
++class Nl2SqlPipelineRobustnessTest {
++
++    FewShotSelector selector = mock(FewShotSelector.class);
++    PromptBuilder prompts = mock(PromptBuilder.class);
++    LlmClient llm = mock(LlmClient.class);
++    SqlGuard guard = mock(SqlGuard.class);
++    SqlExecutor executor = mock(SqlExecutor.class);
++    ChartSuggester chart = mock(ChartSuggester.class);
++    QuestionRewriter rewriter = mock(QuestionRewriter.class);
++    Nl2SqlPipeline pipeline;
++
++    @BeforeEach
++    void setUp() {
++        pipeline = new Nl2SqlPipeline(rewriter, selector, prompts, llm, guard, executor, chart);
++        when(rewriter.rewrite(anyString(), anyList())).thenAnswer(i -> i.getArgument(0));
++        when(selector.select(anyString(), anyInt())).thenReturn(List.of());
++        when(prompts.buildGenerate(anyString(), anyList(), any())).thenReturn(List.of());
++        when(llm.complete(anyList())).thenReturn("SELECT 1 FROM dw.dim_date");
++        when(guard.check(anyString())).thenReturn(GuardResult.allowed("SELECT 1 FROM dw.dim_date LIMIT 1000"));
++    }
++
++    @Test
++    void unexpectedRuntimeExceptionBecomesError() {
++        when(selector.select(anyString(), anyInt())).thenThrow(new IllegalStateException("boom"));
++        TurnOutcome out = pipeline.run("câu hỏi", List.of());
++        assertThat(out.status()).isEqualTo(TurnStatus.ERROR);
++        assertThat(out.message()).isEqualTo("Đã xảy ra lỗi khi xử lý câu hỏi, vui lòng thử lại");
++        assertThat(out.message()).doesNotContain("boom");
++    }
++
++    @Test
++    void statementTimeoutIsNotRepaired() {
++        SQLException sql = new SQLException("canceling statement due to statement timeout", "57014");
++        when(executor.execute(anyString())).thenThrow(new SqlExecutionException(sql.getMessage(),
++                new UncategorizedSQLException("t", "s", sql)));
++        TurnOutcome out = pipeline.run("câu hỏi", List.of());
++        assertThat(out.status()).isEqualTo(TurnStatus.ERROR);
++        assertThat(out.message()).isEqualTo("Truy vấn chạy quá lâu (quá 10 giây), hãy thu hẹp câu hỏi");
++        verify(llm, times(1)).complete(anyList());
++        verify(prompts, never()).buildFix(anyList(), anyString(), anyString());
++    }
++
++    @Test
++    void springQueryTimeoutIsNotRepaired() {
++        when(executor.execute(anyString())).thenThrow(
++                new SqlExecutionException("timeout", new QueryTimeoutException("timeout")));
++        TurnOutcome out = pipeline.run("câu hỏi", List.of());
++        assertThat(out.message()).contains("quá lâu");
++        verify(llm, times(1)).complete(anyList());
++    }
++
++    @Test
++    void connectionFailureIsNotRepaired() {
++        SQLException sql = new SQLException("connection refused", "08001");
++        when(executor.execute(anyString())).thenThrow(new SqlExecutionException(sql.getMessage(),
++                new DataAccessResourceFailureException("conn", sql)));
++        TurnOutcome out = pipeline.run("câu hỏi", List.of());
++        assertThat(out.status()).isEqualTo(TurnStatus.ERROR);
++        assertThat(out.message()).isEqualTo("Không kết nối được cơ sở dữ liệu");
++        verify(llm, times(1)).complete(anyList());
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/nl2sql/SqlExtractorTest.java b/src/test/java/com/fsoft/training/nl2sql/SqlExtractorTest.java
+index 4da9fc5..9e1423a 100644
+--- a/src/test/java/com/fsoft/training/nl2sql/SqlExtractorTest.java
++++ b/src/test/java/com/fsoft/training/nl2sql/SqlExtractorTest.java
+@@ -34,11 +34,27 @@ class SqlExtractorTest {
+     @Test
+     void plainTextPassesThroughForGuardToBlock() {
+         assertThat(SqlExtractor.extract("Xin lỗi")).contains("Xin lỗi");
+     }
+ 
+     @Test
+     void cteIsKept() {
+         String sql = "WITH t AS (SELECT 1 AS a) SELECT a FROM t";
+         assertThat(SqlExtractor.extract(sql)).contains(sql);
+     }
++
++    @Test
++    void singleLineFenceKeepsFirstWord() {
++        assertThat(SqlExtractor.extract("```SELECT a FROM dw.x```")).contains("SELECT a FROM dw.x");
++    }
++
++    @Test
++    void hyphenatedLanguageTagIsStripped() {
++        assertThat(SqlExtractor.extract("```sql-postgres\nSELECT a FROM dw.x\n```")).contains("SELECT a FROM dw.x");
++    }
++
++    @Test
++    void unclosedFenceIsStripped() {
++        assertThat(SqlExtractor.extract("```sql\nSELECT a FROM dw.x;")).contains("SELECT a FROM dw.x");
++        assertThat(SqlExtractor.extract("```\nSELECT a FROM dw.x")).contains("SELECT a FROM dw.x");
++    }
+ }

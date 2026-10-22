@@ -1,0 +1,702 @@
+# Review package: 0cff2bf..HEAD
+
+## Commits
+d1daf8e feat(llm): add OpenAI-compatible LLM client with retry
+
+## Files changed
+ pom.xml                                            |   4 +
+ .../com/fsoft/training/TrainingApplication.java    |   2 +
+ .../java/com/fsoft/training/llm/ChatMessage.java   |  16 ++
+ .../java/com/fsoft/training/llm/LlmClient.java     |   9 ++
+ .../java/com/fsoft/training/llm/LlmConfig.java     |  24 +++
+ .../java/com/fsoft/training/llm/LlmException.java  |  21 +++
+ .../java/com/fsoft/training/llm/LlmProperties.java |  16 ++
+ .../training/llm/OpenAiCompatibleLlmClient.java    | 142 ++++++++++++++++++
+ src/main/java/com/fsoft/training/llm/Sleeper.java  |   9 ++
+ src/main/resources/application.yml                 |   8 +
+ .../llm/OpenAiCompatibleLlmClientTest.java         | 162 +++++++++++++++++++++
+ .../com/fsoft/training/support/FakeLlmClient.java  |  48 ++++++
+ .../fsoft/training/support/FakeLlmClientTest.java  |  42 ++++++
+ .../com/fsoft/training/support/FakeLlmConfig.java  |  15 ++
+ .../training/support/PostgresIntegrationTest.java  |   2 +
+ 15 files changed, 520 insertions(+)
+
+## Diff
+diff --git a/pom.xml b/pom.xml
+index efe60e3..dff85fc 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -27,20 +27,24 @@
+ 		<url/>
+ 	</scm>
+ 	<properties>
+ 		<java.version>21</java.version>
+ 	</properties>
+ 	<dependencies>
+ 		<dependency>
+ 			<groupId>org.springframework.boot</groupId>
+ 			<artifactId>spring-boot-starter-webmvc</artifactId>
+ 		</dependency>
++		<dependency>
++			<groupId>org.springframework.boot</groupId>
++			<artifactId>spring-boot-starter-restclient</artifactId>
++		</dependency>
+ 		<dependency>
+ 			<groupId>org.springframework.boot</groupId>
+ 			<artifactId>spring-boot-starter-jdbc</artifactId>
+ 		</dependency>
+ 		<dependency>
+ 			<groupId>org.springframework.boot</groupId>
+ 			<artifactId>spring-boot-starter-validation</artifactId>
+ 		</dependency>
+ 		<dependency>
+ 			<groupId>org.springframework.boot</groupId>
+diff --git a/src/main/java/com/fsoft/training/TrainingApplication.java b/src/main/java/com/fsoft/training/TrainingApplication.java
+index 1a9f9bd..6e1b48d 100644
+--- a/src/main/java/com/fsoft/training/TrainingApplication.java
++++ b/src/main/java/com/fsoft/training/TrainingApplication.java
+@@ -1,17 +1,19 @@
+ package com.fsoft.training;
+ 
+ import java.util.TimeZone;
+ import org.springframework.boot.SpringApplication;
+ import org.springframework.boot.autoconfigure.SpringBootApplication;
++import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+ 
+ @SpringBootApplication
++@ConfigurationPropertiesScan
+ public class TrainingApplication {
+ 
+ 	public static void main(String[] args) {
+ 		normalizeLegacyTimeZone();
+ 		SpringApplication.run(TrainingApplication.class, args);
+ 	}
+ 
+ 	/**
+ 	 * Some JDKs (e.g. on Windows) report the legacy id "Asia/Saigon", which PostgreSQL 17 rejects
+ 	 * as a TimeZone startup parameter. Map it to its canonical id before any connection is opened.
+diff --git a/src/main/java/com/fsoft/training/llm/ChatMessage.java b/src/main/java/com/fsoft/training/llm/ChatMessage.java
+new file mode 100644
+index 0000000..c6c51fb
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/llm/ChatMessage.java
+@@ -0,0 +1,16 @@
++package com.fsoft.training.llm;
++
++public record ChatMessage(String role, String content) {
++
++    public static ChatMessage system(String content) {
++        return new ChatMessage("system", content);
++    }
++
++    public static ChatMessage user(String content) {
++        return new ChatMessage("user", content);
++    }
++
++    public static ChatMessage assistant(String content) {
++        return new ChatMessage("assistant", content);
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/llm/LlmClient.java b/src/main/java/com/fsoft/training/llm/LlmClient.java
+new file mode 100644
+index 0000000..9b27b88
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/llm/LlmClient.java
+@@ -0,0 +1,9 @@
++package com.fsoft.training.llm;
++
++import java.util.List;
++
++public interface LlmClient {
++
++    /** Sends the conversation to the model and returns the assistant's reply text. */
++    String complete(List<ChatMessage> messages);
++}
+diff --git a/src/main/java/com/fsoft/training/llm/LlmConfig.java b/src/main/java/com/fsoft/training/llm/LlmConfig.java
+new file mode 100644
+index 0000000..9b4795a
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/llm/LlmConfig.java
+@@ -0,0 +1,24 @@
++package com.fsoft.training.llm;
++
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.http.client.SimpleClientHttpRequestFactory;
++import org.springframework.web.client.RestClient;
++
++@Configuration(proxyBeanMethods = false)
++class LlmConfig {
++
++    @Bean
++    Sleeper llmSleeper() {
++        return duration -> Thread.sleep(duration.toMillis());
++    }
++
++    @Bean
++    LlmClient llmClient(RestClient.Builder builder, LlmProperties properties, Sleeper sleeper) {
++        var factory = new SimpleClientHttpRequestFactory();
++        factory.setConnectTimeout(properties.timeout());
++        factory.setReadTimeout(properties.timeout());
++        RestClient.Builder configured = builder.clone().requestFactory(factory);
++        return new OpenAiCompatibleLlmClient(configured, properties, sleeper);
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/llm/LlmException.java b/src/main/java/com/fsoft/training/llm/LlmException.java
+new file mode 100644
+index 0000000..09d237e
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/llm/LlmException.java
+@@ -0,0 +1,21 @@
++package com.fsoft.training.llm;
++
++public class LlmException extends RuntimeException {
++
++    private final String userMessage;
++
++    public LlmException(String userMessage) {
++        super(userMessage);
++        this.userMessage = userMessage;
++    }
++
++    public LlmException(String userMessage, Throwable cause) {
++        super(userMessage, cause);
++        this.userMessage = userMessage;
++    }
++
++    /** Vietnamese message safe to show to end users. */
++    public String userMessage() {
++        return userMessage;
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/llm/LlmProperties.java b/src/main/java/com/fsoft/training/llm/LlmProperties.java
+new file mode 100644
+index 0000000..23534eb
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/llm/LlmProperties.java
+@@ -0,0 +1,16 @@
++package com.fsoft.training.llm;
++
++import java.time.Duration;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++
++@ConfigurationProperties("llm")
++public record LlmProperties(String baseUrl, String apiKey, String model, Duration timeout, int maxRetries,
++        double temperature) {
++
++    /** Omits the API key so it can never leak through logging. */
++    @Override
++    public String toString() {
++        return "LlmProperties[baseUrl=" + baseUrl + ", model=" + model + ", timeout=" + timeout
++                + ", maxRetries=" + maxRetries + ", temperature=" + temperature + "]";
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/llm/OpenAiCompatibleLlmClient.java b/src/main/java/com/fsoft/training/llm/OpenAiCompatibleLlmClient.java
+new file mode 100644
+index 0000000..9a35d00
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/llm/OpenAiCompatibleLlmClient.java
+@@ -0,0 +1,142 @@
++package com.fsoft.training.llm;
++
++import java.time.Duration;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.web.client.ResourceAccessException;
++import org.springframework.web.client.RestClient;
++import org.springframework.web.client.RestClientException;
++import org.springframework.web.client.RestClientResponseException;
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.json.JsonMapper;
++
++public class OpenAiCompatibleLlmClient implements LlmClient {
++
++    private static final Logger log = LoggerFactory.getLogger(OpenAiCompatibleLlmClient.class);
++    private static final Duration MAX_WAIT = Duration.ofSeconds(30);
++    private static final Duration BASE_BACKOFF = Duration.ofSeconds(2);
++
++    static final String MSG_OVERLOADED = "Dịch vụ AI đang quá tải, thử lại sau ít phút";
++    static final String MSG_NO_KEY = "Chưa cấu hình LLM_API_KEY";
++    static final String MSG_BAD_KEY = "API key của dịch vụ AI không hợp lệ hoặc không được phép";
++    static final String MSG_GENERIC = "Lỗi khi gọi dịch vụ AI";
++    static final String MSG_TIMEOUT = "Dịch vụ AI không phản hồi";
++
++    private final RestClient restClient;
++    private final LlmProperties properties;
++    private final Sleeper sleeper;
++    private final JsonMapper mapper = JsonMapper.builder().build();
++    private final String url;
++
++    public OpenAiCompatibleLlmClient(RestClient.Builder builder, LlmProperties properties, Sleeper sleeper) {
++        this.restClient = builder.build();
++        this.properties = properties;
++        this.sleeper = sleeper;
++        String base = properties.baseUrl() == null ? "" : properties.baseUrl().trim();
++        this.url = (base.endsWith("/") ? base : base + "/") + "chat/completions";
++    }
++
++    @Override
++    public String complete(List<ChatMessage> messages) {
++        String key = properties.apiKey();
++        if (key == null || key.isBlank()) {
++            throw new LlmException(MSG_NO_KEY);
++        }
++        String body = buildBody(messages);
++        int attempt = 0;
++        while (true) {
++            try {
++                String response = restClient.post()
++                        .uri(url)
++                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + key)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .accept(MediaType.APPLICATION_JSON)
++                        .body(body)
++                        .retrieve()
++                        .body(String.class);
++                return extractContent(response);
++            }
++            catch (RestClientResponseException e) {
++                int status = e.getStatusCode().value();
++                if (status == 429 || status >= 500) {
++                    if (attempt >= properties.maxRetries()) {
++                        log.warn("LLM call failed with status {} after {} retries", status, attempt);
++                        throw new LlmException(MSG_OVERLOADED, e);
++                    }
++                    Duration wait = waitFor(e.getResponseHeaders(), attempt);
++                    attempt++;
++                    log.warn("LLM call returned {}, retry {}/{} in {}s", status, attempt,
++                            properties.maxRetries(), wait.toSeconds());
++                    pause(wait);
++                    continue;
++                }
++                log.warn("LLM call failed with status {}", status);
++                if (status == 401 || status == 403) {
++                    throw new LlmException(MSG_BAD_KEY, e);
++                }
++                throw new LlmException(MSG_GENERIC, e);
++            }
++            catch (ResourceAccessException e) {
++                log.warn("LLM call I/O failure: {}", e.getClass().getSimpleName());
++                throw new LlmException(MSG_TIMEOUT, e);
++            }
++            catch (RestClientException e) {
++                log.warn("LLM call failed: {}", e.getClass().getSimpleName());
++                throw new LlmException(MSG_GENERIC, e);
++            }
++        }
++    }
++
++    private String buildBody(List<ChatMessage> messages) {
++        Map<String, Object> payload = new LinkedHashMap<>();
++        payload.put("model", properties.model());
++        payload.put("messages", messages);
++        payload.put("temperature", properties.temperature());
++        return mapper.writeValueAsString(payload);
++    }
++
++    private String extractContent(String response) {
++        try {
++            JsonNode content = mapper.readTree(response).path("choices").path(0).path("message").path("content");
++            if (content.isString() && !content.asString().isBlank()) {
++                return content.asString();
++            }
++        }
++        catch (RuntimeException e) {
++            throw new LlmException(MSG_GENERIC, e);
++        }
++        throw new LlmException(MSG_GENERIC);
++    }
++
++    private Duration waitFor(HttpHeaders headers, int attempt) {
++        Duration wait = BASE_BACKOFF.multipliedBy(1L << Math.min(attempt, 10));
++        String retryAfter = headers == null ? null : headers.getFirst(HttpHeaders.RETRY_AFTER);
++        if (retryAfter != null) {
++            try {
++                long seconds = Long.parseLong(retryAfter.trim());
++                if (seconds >= 0) {
++                    wait = Duration.ofSeconds(seconds);
++                }
++            }
++            catch (NumberFormatException ignored) {
++                // fall back to exponential backoff
++            }
++        }
++        return wait.compareTo(MAX_WAIT) > 0 ? MAX_WAIT : wait;
++    }
++
++    private void pause(Duration wait) {
++        try {
++            sleeper.sleep(wait);
++        }
++        catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new LlmException(MSG_TIMEOUT, e);
++        }
++    }
++}
+diff --git a/src/main/java/com/fsoft/training/llm/Sleeper.java b/src/main/java/com/fsoft/training/llm/Sleeper.java
+new file mode 100644
+index 0000000..a503e8e
+--- /dev/null
++++ b/src/main/java/com/fsoft/training/llm/Sleeper.java
+@@ -0,0 +1,9 @@
++package com.fsoft.training.llm;
++
++import java.time.Duration;
++
++@FunctionalInterface
++public interface Sleeper {
++
++    void sleep(Duration duration) throws InterruptedException;
++}
+diff --git a/src/main/resources/application.yml b/src/main/resources/application.yml
+index 5f6835b..3ce5a0e 100644
+--- a/src/main/resources/application.yml
++++ b/src/main/resources/application.yml
+@@ -10,10 +10,18 @@ spring:
+ app:
+   datasource:
+     app:
+       url: jdbc:postgresql://localhost:5432/textsql
+       username: ${APP_DB_USER:app_rw}
+       password: ${APP_DB_PASSWORD:app_rw_dev}
+     analyst:
+       url: jdbc:postgresql://localhost:5432/textsql
+       username: ${ANALYST_DB_USER:analyst_ro}
+       password: ${ANALYST_DB_PASSWORD:analyst_ro_dev}
++
++llm:
++  base-url: ${LLM_BASE_URL:https://generativelanguage.googleapis.com/v1beta/openai/}
++  api-key: ${LLM_API_KEY:}
++  model: ${LLM_MODEL:gemini-2.5-flash}
++  timeout: 30s
++  max-retries: 3
++  temperature: 0
+diff --git a/src/test/java/com/fsoft/training/llm/OpenAiCompatibleLlmClientTest.java b/src/test/java/com/fsoft/training/llm/OpenAiCompatibleLlmClientTest.java
+new file mode 100644
+index 0000000..7e72572
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/llm/OpenAiCompatibleLlmClientTest.java
+@@ -0,0 +1,162 @@
++package com.fsoft.training.llm;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
++import static org.springframework.test.web.client.match.MockRestRequestMatchers.jsonPath;
++import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
++import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
++import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
++import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
++
++import java.io.IOException;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.List;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.HttpMethod;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.test.web.client.ExpectedCount;
++import org.springframework.test.web.client.MockRestServiceServer;
++import org.springframework.web.client.RestClient;
++
++class OpenAiCompatibleLlmClientTest {
++
++    private static final String URL = "https://llm.example.test/v1/chat/completions";
++    private static final String OK = """
++            {"choices":[{"message":{"role":"assistant","content":"SELECT 1"}}]}""";
++
++    private final List<Duration> sleeps = new ArrayList<>();
++    private MockRestServiceServer server;
++    private OpenAiCompatibleLlmClient client;
++
++    @BeforeEach
++    void setUp() {
++        sleeps.clear();
++        client = build("https://llm.example.test/v1/", "secret-key");
++    }
++
++    private OpenAiCompatibleLlmClient build(String baseUrl, String key) {
++        RestClient.Builder builder = RestClient.builder();
++        server = MockRestServiceServer.bindTo(builder).build();
++        return new OpenAiCompatibleLlmClient(builder,
++                new LlmProperties(baseUrl, key, "test-model", Duration.ofSeconds(5), 3, 0), sleeps::add);
++    }
++
++    private static List<ChatMessage> msgs() {
++        return List.of(ChatMessage.system("sys"), ChatMessage.user("hi"));
++    }
++
++    @Test
++    void sendsExpectedRequestAndReturnsContent() {
++        server.expect(requestTo(URL))
++                .andExpect(method(HttpMethod.POST))
++                .andExpect(header("Authorization", "Bearer secret-key"))
++                .andExpect(jsonPath("$.model").value("test-model"))
++                .andExpect(jsonPath("$.temperature").value(0.0))
++                .andExpect(jsonPath("$.messages[0].role").value("system"))
++                .andExpect(jsonPath("$.messages[1].content").value("hi"))
++                .andRespond(withSuccess(OK, MediaType.APPLICATION_JSON));
++
++        assertThat(client.complete(msgs())).isEqualTo("SELECT 1");
++        server.verify();
++    }
++
++    @Test
++    void baseUrlWithoutTrailingSlashWorks() {
++        client = build("https://llm.example.test/v1", "k");
++        server.expect(requestTo(URL)).andRespond(withSuccess(OK, MediaType.APPLICATION_JSON));
++        assertThat(client.complete(msgs())).isEqualTo("SELECT 1");
++        server.verify();
++    }
++
++    @Test
++    void retriesOn429ThenSucceeds() {
++        server.expect(ExpectedCount.times(2), requestTo(URL)).andRespond(withStatus(HttpStatus.TOO_MANY_REQUESTS));
++        server.expect(requestTo(URL)).andRespond(withSuccess(OK, MediaType.APPLICATION_JSON));
++
++        assertThat(client.complete(msgs())).isEqualTo("SELECT 1");
++        server.verify();
++        assertThat(sleeps).containsExactly(Duration.ofSeconds(2), Duration.ofSeconds(4));
++    }
++
++    @Test
++    void usesRetryAfterHeaderAndCapsIt() {
++        server.expect(requestTo(URL)).andRespond(withStatus(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", "7"));
++        server.expect(requestTo(URL)).andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE).header("Retry-After", "999"));
++        server.expect(requestTo(URL)).andRespond(withStatus(HttpStatus.BAD_GATEWAY).header("Retry-After", "soon"));
++        server.expect(requestTo(URL)).andRespond(withSuccess(OK, MediaType.APPLICATION_JSON));
++
++        client.complete(msgs());
++        assertThat(sleeps).containsExactly(Duration.ofSeconds(7), Duration.ofSeconds(30), Duration.ofSeconds(8));
++    }
++
++    @Test
++    void failsAfterRetriesExhausted() {
++        server.expect(ExpectedCount.times(4), requestTo(URL)).andRespond(withStatus(HttpStatus.TOO_MANY_REQUESTS));
++
++        assertThatThrownBy(() -> client.complete(msgs()))
++                .isInstanceOf(LlmException.class)
++                .satisfies(e -> assertThat(((LlmException) e).userMessage()).contains("quá tải"));
++        server.verify();
++        assertThat(sleeps).hasSize(3);
++    }
++
++    @Test
++    void blankKeyFailsWithoutHttp() {
++        client = build("https://llm.example.test/v1/", " ");
++        assertThatThrownBy(() -> client.complete(msgs()))
++                .isInstanceOf(LlmException.class)
++                .satisfies(e -> assertThat(((LlmException) e).userMessage()).contains("LLM_API_KEY"));
++        server.verify(); // no expectations -> no requests
++    }
++
++    @Test
++    void badRequestIsNotRetried() {
++        server.expect(ExpectedCount.once(), requestTo(URL)).andRespond(withStatus(HttpStatus.BAD_REQUEST));
++
++        assertThatThrownBy(() -> client.complete(msgs()))
++                .isInstanceOf(LlmException.class)
++                .satisfies(e -> assertThat(((LlmException) e).userMessage()).isEqualTo("Lỗi khi gọi dịch vụ AI"));
++        server.verify();
++        assertThat(sleeps).isEmpty();
++    }
++
++    @Test
++    void unauthorizedMentionsApiKeyAndNeverLeaksIt() {
++        server.expect(requestTo(URL)).andRespond(withStatus(HttpStatus.UNAUTHORIZED));
++
++        assertThatThrownBy(() -> client.complete(msgs()))
++                .isInstanceOf(LlmException.class)
++                .satisfies(e -> {
++                    assertThat(((LlmException) e).userMessage()).contains("API key");
++                    assertThat(e.getMessage()).doesNotContain("secret-key");
++                });
++    }
++
++    @Test
++    void ioErrorBecomesNoResponse() {
++        server.expect(requestTo(URL)).andRespond(request -> {
++            throw new IOException("timed out");
++        });
++
++        assertThatThrownBy(() -> client.complete(msgs()))
++                .isInstanceOf(LlmException.class)
++                .satisfies(e -> assertThat(((LlmException) e).userMessage()).isEqualTo("Dịch vụ AI không phản hồi"));
++    }
++
++    @Test
++    void emptyChoicesFails() {
++        server.expect(requestTo(URL)).andRespond(withSuccess("{\"choices\":[]}", MediaType.APPLICATION_JSON));
++        assertThatThrownBy(() -> client.complete(msgs())).isInstanceOf(LlmException.class);
++    }
++
++    @Test
++    void emptyContentFails() {
++        server.expect(requestTo(URL)).andRespond(
++                withSuccess("{\"choices\":[{\"message\":{\"content\":\"\"}}]}", MediaType.APPLICATION_JSON));
++        assertThatThrownBy(() -> client.complete(msgs())).isInstanceOf(LlmException.class);
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/support/FakeLlmClient.java b/src/test/java/com/fsoft/training/support/FakeLlmClient.java
+new file mode 100644
+index 0000000..fa8232d
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/support/FakeLlmClient.java
+@@ -0,0 +1,48 @@
++package com.fsoft.training.support;
++
++import com.fsoft.training.llm.ChatMessage;
++import com.fsoft.training.llm.LlmClient;
++import com.fsoft.training.llm.LlmException;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Deque;
++import java.util.List;
++import java.util.function.Supplier;
++
++/** Scripted LlmClient for tests: queue responses/failures, inspect recorded calls. */
++public class FakeLlmClient implements LlmClient {
++
++    private final Deque<Supplier<String>> queue = new ArrayDeque<>();
++    private final List<List<ChatMessage>> calls = new ArrayList<>();
++
++    public synchronized void enqueue(String... responses) {
++        for (String response : responses) {
++            queue.add(() -> response);
++        }
++    }
++
++    public synchronized void enqueueFailure(LlmException e) {
++        queue.add(() -> {
++            throw e;
++        });
++    }
++
++    public synchronized List<List<ChatMessage>> calls() {
++        return List.copyOf(calls);
++    }
++
++    public synchronized void reset() {
++        queue.clear();
++        calls.clear();
++    }
++
++    @Override
++    public synchronized String complete(List<ChatMessage> messages) {
++        calls.add(List.copyOf(messages));
++        Supplier<String> next = queue.poll();
++        if (next == null) {
++            throw new IllegalStateException("FakeLlmClient: no response queued");
++        }
++        return next.get();
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/support/FakeLlmClientTest.java b/src/test/java/com/fsoft/training/support/FakeLlmClientTest.java
+new file mode 100644
+index 0000000..aed7511
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/support/FakeLlmClientTest.java
+@@ -0,0 +1,42 @@
++package com.fsoft.training.support;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.fsoft.training.llm.ChatMessage;
++import com.fsoft.training.llm.LlmException;
++import java.util.List;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++class FakeLlmClientTest {
++
++    private final FakeLlmClient fake = new FakeLlmClient();
++
++    @BeforeEach
++    void setUp() {
++        fake.reset();
++    }
++
++    @Test
++    void returnsQueuedResponsesInOrderAndRecordsCalls() {
++        fake.enqueue("a", "b");
++        List<ChatMessage> first = List.of(ChatMessage.user("q1"));
++        assertThat(fake.complete(first)).isEqualTo("a");
++        assertThat(fake.complete(List.of(ChatMessage.user("q2")))).isEqualTo("b");
++        assertThat(fake.calls()).hasSize(2).first().isEqualTo(first);
++    }
++
++    @Test
++    void throwsQueuedFailure() {
++        fake.enqueueFailure(new LlmException("boom"));
++        assertThatThrownBy(() -> fake.complete(List.of())).isInstanceOf(LlmException.class).hasMessage("boom");
++    }
++
++    @Test
++    void emptyQueueThrows() {
++        assertThatThrownBy(() -> fake.complete(List.of()))
++                .isInstanceOf(IllegalStateException.class)
++                .hasMessage("FakeLlmClient: no response queued");
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/support/FakeLlmConfig.java b/src/test/java/com/fsoft/training/support/FakeLlmConfig.java
+new file mode 100644
+index 0000000..07128a2
+--- /dev/null
++++ b/src/test/java/com/fsoft/training/support/FakeLlmConfig.java
+@@ -0,0 +1,15 @@
++package com.fsoft.training.support;
++
++import org.springframework.boot.test.context.TestConfiguration;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Primary;
++
++@TestConfiguration(proxyBeanMethods = false)
++public class FakeLlmConfig {
++
++    @Bean
++    @Primary
++    public FakeLlmClient fakeLlmClient() {
++        return new FakeLlmClient();
++    }
++}
+diff --git a/src/test/java/com/fsoft/training/support/PostgresIntegrationTest.java b/src/test/java/com/fsoft/training/support/PostgresIntegrationTest.java
+index c920792..fe046ce 100644
+--- a/src/test/java/com/fsoft/training/support/PostgresIntegrationTest.java
++++ b/src/test/java/com/fsoft/training/support/PostgresIntegrationTest.java
+@@ -1,25 +1,27 @@
+ package com.fsoft.training.support;
+ 
+ import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.context.annotation.Import;
+ import org.springframework.jdbc.core.JdbcTemplate;
+ import org.springframework.jdbc.datasource.DriverManagerDataSource;
+ import org.springframework.test.context.DynamicPropertyRegistry;
+ import org.springframework.test.context.DynamicPropertySource;
+ import org.testcontainers.postgresql.PostgreSQLContainer;
+ import org.testcontainers.utility.MountableFile;
+ 
+ /**
+  * Base class for integration tests. One Postgres container (with db/init scripts applied)
+  * is shared by every subclass in the JVM.
+  */
+ @SpringBootTest
++@Import(FakeLlmConfig.class)
+ public abstract class PostgresIntegrationTest {
+ 
+     protected static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.6")
+             .withDatabaseName("textsql")
+             .withUsername("postgres")
+             .withPassword("postgres")
+             .withCopyFileToContainer(MountableFile.forHostPath("db/init"), "/docker-entrypoint-initdb.d/");
+ 
+     static {
+         POSTGRES.start();

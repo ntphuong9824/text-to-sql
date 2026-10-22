@@ -1,0 +1,334 @@
+# Review package: fac2f44..HEAD
+
+## Commits
+e0c16db fix(chat): 404 on malformed id, keep BigDecimal fidelity, serialize turn inserts
+
+## Files changed
+ .../fsoft/training/config/ApiExceptionHandler.java |  8 ++++
+ .../conversation/ConversationRepository.java       |  6 +++
+ .../training/conversation/ConversationService.java | 12 ++++--
+ .../training/conversation/MessageRepository.java   | 15 ++++---
+ .../db/migration/V2__messages_turn_unique.sql      |  2 +
+ .../fsoft/training/conversation/ChatApiTest.java   | 47 ++++++++++++++++++++++
+ .../com/fsoft/training/support/FakeLlmClient.java  | 10 +++++
+ 7 files changed, 92 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/config/ApiExceptionHandler.java b/src/main/java/com/fsoft/training/config/ApiExceptionHandler.java
+index a5f39f4..f2ebae0 100644
+--- a/src/main/java/com/fsoft/training/config/ApiExceptionHandler.java
++++ b/src/main/java/com/fsoft/training/config/ApiExceptionHandler.java
+@@ -42,20 +42,28 @@ public class ApiExceptionHandler {
+     ResponseEntity<ErrorResponse> onUsernameTaken(UsernameTakenException ex) {
+         return ResponseEntity.status(HttpStatus.CONFLICT).body(new ErrorResponse("Tên đăng nhập đã tồn tại"));
+     }
+ 
+     @ExceptionHandler(com.fsoft.training.conversation.ConversationNotFoundException.class)
+     ResponseEntity<ErrorResponse> onConversationNotFound(
+             com.fsoft.training.conversation.ConversationNotFoundException ex) {
+         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ErrorResponse("Không tìm thấy hội thoại"));
+     }
+ 
++    /** A malformed id (e.g. a non-UUID path variable) is indistinguishable from a missing resource. */
++    @ExceptionHandler(org.springframework.web.method.annotation.MethodArgumentTypeMismatchException.class)
++    ResponseEntity<ErrorResponse> onTypeMismatch(
++            org.springframework.web.method.annotation.MethodArgumentTypeMismatchException ex) {
++        log.debug("Malformed path/query argument", ex);
++        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ErrorResponse("Không tìm thấy hội thoại"));
++    }
++
+     private static String messageFor(HttpStatusCode status) {
+         return switch (status.value()) {
+             case 400 -> "Yêu cầu không hợp lệ";
+             case 404 -> "Không tìm thấy";
+             case 405 -> "Phương thức không được hỗ trợ";
+             case 415 -> "Định dạng nội dung không được hỗ trợ";
+             default -> status.is5xxServerError()
+                     ? "Đã xảy ra lỗi hệ thống, vui lòng thử lại sau" : "Yêu cầu không thể xử lý";
+         };
+     }
+diff --git a/src/main/java/com/fsoft/training/conversation/ConversationRepository.java b/src/main/java/com/fsoft/training/conversation/ConversationRepository.java
+index 701d704..78aedf2 100644
+--- a/src/main/java/com/fsoft/training/conversation/ConversationRepository.java
++++ b/src/main/java/com/fsoft/training/conversation/ConversationRepository.java
+@@ -25,20 +25,26 @@ public class ConversationRepository {
+                 .param("id", id).param("user", userId).param("title", title).update();
+     }
+ 
+     public Optional<Row> findOwned(UUID id, long userId) {
+         return jdbc.sql("select id, title from app.conversations where id = :id and user_id = :user")
+                 .param("id", id).param("user", userId)
+                 .query((rs, n) -> new Row(rs.getObject("id", UUID.class), rs.getString("title")))
+                 .optional();
+     }
+ 
++    /** Row-locks the conversation until the transaction ends; false if it is gone or not the user's. */
++    public boolean lockOwned(UUID id, long userId) {
++        return jdbc.sql("select 1 from app.conversations where id = :id and user_id = :user for update")
++                .param("id", id).param("user", userId).query(Integer.class).optional().isPresent();
++    }
++
+     public List<ConversationSummary> list(long userId) {
+         return jdbc.sql("select id, title, updated_at from app.conversations where user_id = :user "
+                         + "order by updated_at desc, created_at desc")
+                 .param("user", userId)
+                 .query((rs, n) -> new ConversationSummary(rs.getObject("id", UUID.class), rs.getString("title"),
+                         rs.getObject("updated_at", OffsetDateTime.class).toInstant()))
+                 .list();
+     }
+ 
+     public void touch(UUID id) {
+diff --git a/src/main/java/com/fsoft/training/conversation/ConversationService.java b/src/main/java/com/fsoft/training/conversation/ConversationService.java
+index cb29657..2f2a04b 100644
+--- a/src/main/java/com/fsoft/training/conversation/ConversationService.java
++++ b/src/main/java/com/fsoft/training/conversation/ConversationService.java
+@@ -2,20 +2,21 @@ package com.fsoft.training.conversation;
+ 
+ import com.fsoft.training.conversation.ConversationDtos.ChatResponse;
+ import com.fsoft.training.conversation.ConversationDtos.ConversationDetail;
+ import com.fsoft.training.conversation.ConversationDtos.ConversationSummary;
+ import com.fsoft.training.conversation.ConversationDtos.TurnDto;
+ import com.fsoft.training.nl2sql.Nl2SqlPipeline;
+ import com.fsoft.training.nl2sql.TurnContext;
+ import com.fsoft.training.nl2sql.TurnOutcome;
+ import com.fsoft.training.nl2sql.TurnStatus;
+ import com.fsoft.training.warehouse.ColumnInfo;
++import java.time.Instant;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.UUID;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.support.TransactionTemplate;
+ 
+ @Service
+ public class ConversationService {
+ 
+     private static final int MAX_TITLE = 60;
+@@ -47,25 +48,30 @@ public class ConversationService {
+             var row = conversations.findOwned(conversationIdOrNull, userId)
+                     .orElseThrow(ConversationNotFoundException::new);
+             id = row.id();
+             title = row.title();
+             history = historyOf(messages.findAll(id));
+         }
+ 
+         TurnOutcome outcome = pipeline.run(question, history);
+ 
+         TurnDto turn = tx.execute(status -> {
++            // Serializes concurrent asks on one conversation and detects deletion during the pipeline run.
++            if (!conversations.lockOwned(id, userId)) {
++                throw new ConversationNotFoundException();
++            }
+             int index = messages.count(id);
+-            messages.insert(id, index, question, outcome.rewrittenQuestion(), outcome.sql(), outcome.status(),
+-                    outcome.message(), outcome.result(), outcome.chart());
++            Instant createdAt = messages.insert(id, index, question, outcome.rewrittenQuestion(), outcome.sql(),
++                    outcome.status(), outcome.message(), outcome.result(), outcome.chart());
+             conversations.touch(id);
+-            return messages.findAll(id).stream().filter(t -> t.turnIndex() == index).findFirst().orElseThrow();
++            return new TurnDto(index, question, outcome.rewrittenQuestion(), outcome.sql(), outcome.status(),
++                    outcome.message(), outcome.result(), outcome.chart(), createdAt);
+         });
+         return new ChatResponse(id, title, turn);
+     }
+ 
+     public List<ConversationSummary> list(long userId) {
+         return conversations.list(userId);
+     }
+ 
+     public ConversationDetail get(long userId, UUID id) {
+         var row = conversations.findOwned(id, userId).orElseThrow(ConversationNotFoundException::new);
+diff --git a/src/main/java/com/fsoft/training/conversation/MessageRepository.java b/src/main/java/com/fsoft/training/conversation/MessageRepository.java
+index 3eca350..d93fc35 100644
+--- a/src/main/java/com/fsoft/training/conversation/MessageRepository.java
++++ b/src/main/java/com/fsoft/training/conversation/MessageRepository.java
+@@ -1,51 +1,56 @@
+ package com.fsoft.training.conversation;
+ 
+ import com.fsoft.training.chart.ChartSpec;
+ import com.fsoft.training.conversation.ConversationDtos.TurnDto;
+ import com.fsoft.training.nl2sql.TurnStatus;
+ import com.fsoft.training.warehouse.QueryResult;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
++import java.time.Instant;
+ import java.time.OffsetDateTime;
+ import java.util.List;
+ import java.util.UUID;
+ import org.springframework.jdbc.core.simple.JdbcClient;
+ import org.springframework.stereotype.Repository;
++import tools.jackson.databind.DeserializationFeature;
+ import tools.jackson.databind.json.JsonMapper;
+ 
+ @Repository
+ public class MessageRepository {
+ 
+     private final JdbcClient jdbc;
+-    private final JsonMapper mapper = JsonMapper.builder().build();
++    private final JsonMapper mapper = JsonMapper.builder()
++            .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).build();
+ 
+     public MessageRepository(JdbcClient jdbc) {
+         this.jdbc = jdbc;
+     }
+ 
+     public int count(UUID conversationId) {
+         return jdbc.sql("select count(*) from app.messages where conversation_id = :c")
+                 .param("c", conversationId).query(Integer.class).single();
+     }
+ 
+-    public void insert(UUID conversationId, int turnIndex, String question, String rewritten, String sql,
++    /** @return the stored created_at */
++    public Instant insert(UUID conversationId, int turnIndex, String question, String rewritten, String sql,
+                        TurnStatus status, String message, QueryResult result, ChartSpec chart) {
+-        jdbc.sql("insert into app.messages(conversation_id, turn_index, question, rewritten_question, sql, "
++        return jdbc.sql("insert into app.messages(conversation_id, turn_index, question, rewritten_question, sql, "
+                         + "status, message, chart, result) values (:c, :idx, :q, :rq, :sql, :status, :msg, "
+-                        + "cast(:chart as jsonb), cast(:result as jsonb))")
++                        + "cast(:chart as jsonb), cast(:result as jsonb)) returning created_at")
+                 .param("c", conversationId).param("idx", turnIndex).param("q", question)
+                 .param("rq", rewritten).param("sql", sql).param("status", status.name())
+                 .param("msg", message)
+                 .param("chart", chart == null ? null : mapper.writeValueAsString(chart))
+                 .param("result", result == null ? null : mapper.writeValueAsString(result))
+-                .update();
++                .query((rs, n) -> rs.getObject("created_at", OffsetDateTime.class).toInstant())
++                .single();
+     }
+ 
+     /** All turns, oldest first. */
+     public List<TurnDto> findAll(UUID conversationId) {
+         return jdbc.sql("select turn_index, question, rewritten_question, sql, status, message, "
+                         + "chart::text as chart, result::text as result, created_at "
+                         + "from app.messages where conversation_id = :c order by turn_index")
+                 .param("c", conversationId).query(this::map).list();
+     }
+ 
+diff --git a/src/main/resources/db/migration/V2__messages_turn_unique.sql b/src/main/resources/db/migration/V2__messages_turn_unique.sql
+new file mode 100644
+index 0000000..dd83464
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__messages_turn_unique.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE app.messages
++    ADD CONSTRAINT uq_messages_conversation_turn UNIQUE (conversation_id, turn_index);
+diff --git a/src/test/java/com/fsoft/training/conversation/ChatApiTest.java b/src/test/java/com/fsoft/training/conversation/ChatApiTest.java
+index 576e70d..5b695a2 100644
+--- a/src/test/java/com/fsoft/training/conversation/ChatApiTest.java
++++ b/src/test/java/com/fsoft/training/conversation/ChatApiTest.java
+@@ -194,11 +194,58 @@ class ChatApiTest extends PostgresIntegrationTest {
+ 
+     @Test
+     void deleteCascadesMessages() throws Exception {
+         String id = firstChat();
+         mvc.perform(delete("/api/conversations/" + id).header("Authorization", alice))
+                 .andExpect(status().isNoContent());
+         mvc.perform(get("/api/conversations/" + id).header("Authorization", alice))
+                 .andExpect(status().isNotFound());
+         assertThat(superuserJdbc().queryForObject("select count(*) from app.messages", Integer.class)).isZero();
+     }
++
++    @Test
++    void malformedConversationIdIs404() throws Exception {
++        mvc.perform(get("/api/conversations/abc").header("Authorization", alice))
++                .andExpect(status().isNotFound())
++                .andExpect(jsonPath("$.message").value("Không tìm thấy hội thoại"));
++        mvc.perform(delete("/api/conversations/abc").header("Authorization", alice))
++                .andExpect(status().isNotFound());
++    }
++
++    @Test
++    void historyReplaysExactlyWhatTheLiveTurnReturned() throws Exception {
++        JsonMapper exact = JsonMapper.builder()
++                .enable(tools.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).build();
++        llm.enqueue("SELECT region AS r, CAST(NULL AS int) AS n, ROUND(SUM(revenue), 2) AS total, "
++                + "CAST(100.00 AS numeric(10,2)) AS hundred FROM dw.fact_sales f "
++                + "JOIN dw.dim_customer c ON c.customer_key = f.customer_key GROUP BY region");
++        MvcResult live = chat(alice, null, "tổng doanh thu", 200);
++        JsonNode liveRes = exact.readTree(live.getResponse().getContentAsString());
++        assertThat(liveRes.get("turn").get("status").asString()).isEqualTo("OK");
++        assertThat(live.getResponse().getContentAsString()).contains("100.00");
++        String id = liveRes.get("conversationId").asString();
++        JsonNode hist = exact.readTree(mvc.perform(get("/api/conversations/" + id).header("Authorization", alice))
++                .andReturn().getResponse().getContentAsString());
++        assertThat(hist.get("turns").get(0)).isEqualTo(liveRes.get("turn"));
++        assertThat(hist.get("turns").get(0).get("result").toString())
++                .isEqualTo(liveRes.get("turn").get("result").toString()).contains("100.00");
++        assertThat(hist.get("turns").get(0).get("result").get("truncated").asBoolean()).isFalse();
++    }
++
++    @Test
++    void conversationDeletedWhilePipelineRunsIs404() throws Exception {
++        String id = firstChat();
++        llm.reset();
++        llm.onComplete(() -> superuserJdbc().update("delete from app.conversations"));
++        llm.enqueue("doanh thu tháng 10 theo khu vực", GOOD_SQL);
++        chat(alice, id, "còn tháng 10?", 404);
++        assertThat(superuserJdbc().queryForObject("select count(*) from app.messages", Integer.class)).isZero();
++    }
++
++    @Test
++    void duplicateTurnIndexIsRejectedByDatabase() throws Exception {
++        String id = firstChat();
++        org.assertj.core.api.Assertions.assertThatThrownBy(() -> superuserJdbc().update(
++                "insert into app.messages(conversation_id, turn_index, question, status) values (?::uuid, 0, 'x', 'OK')", id))
++                .isInstanceOf(org.springframework.dao.DuplicateKeyException.class);
++    }
+ }
+diff --git a/src/test/java/com/fsoft/training/support/FakeLlmClient.java b/src/test/java/com/fsoft/training/support/FakeLlmClient.java
+index fa8232d..65feaa3 100644
+--- a/src/test/java/com/fsoft/training/support/FakeLlmClient.java
++++ b/src/test/java/com/fsoft/training/support/FakeLlmClient.java
+@@ -7,42 +7,52 @@ import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.Deque;
+ import java.util.List;
+ import java.util.function.Supplier;
+ 
+ /** Scripted LlmClient for tests: queue responses/failures, inspect recorded calls. */
+ public class FakeLlmClient implements LlmClient {
+ 
+     private final Deque<Supplier<String>> queue = new ArrayDeque<>();
+     private final List<List<ChatMessage>> calls = new ArrayList<>();
++    private Runnable beforeEachResponse;
++
++    /** Runs (inside complete) before each scripted response; cleared by reset(). */
++    public synchronized void onComplete(Runnable hook) {
++        this.beforeEachResponse = hook;
++    }
+ 
+     public synchronized void enqueue(String... responses) {
+         for (String response : responses) {
+             queue.add(() -> response);
+         }
+     }
+ 
+     public synchronized void enqueueFailure(LlmException e) {
+         queue.add(() -> {
+             throw e;
+         });
+     }
+ 
+     public synchronized List<List<ChatMessage>> calls() {
+         return List.copyOf(calls);
+     }
+ 
+     public synchronized void reset() {
+         queue.clear();
+         calls.clear();
++        beforeEachResponse = null;
+     }
+ 
+     @Override
+     public synchronized String complete(List<ChatMessage> messages) {
+         calls.add(List.copyOf(messages));
++        if (beforeEachResponse != null) {
++            beforeEachResponse.run();
++        }
+         Supplier<String> next = queue.poll();
+         if (next == null) {
+             throw new IllegalStateException("FakeLlmClient: no response queued");
+         }
+         return next.get();
+     }
+ }

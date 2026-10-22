@@ -1,0 +1,125 @@
+# Review package: dff1108..HEAD
+
+## Commits
+296711d fix: primary app JdbcTemplate and durable timezone normalization
+
+## Files changed
+ .../java/com/fsoft/training/TrainingApplication.java  | 12 ++++++++++++
+ .../com/fsoft/training/config/DataSourceConfig.java   |  6 ++++++
+ .../com/fsoft/training/warehouse/ChinookLoadTest.java | 19 +++++++++++++++++++
+ 3 files changed, 37 insertions(+)
+
+## Diff
+diff --git a/src/main/java/com/fsoft/training/TrainingApplication.java b/src/main/java/com/fsoft/training/TrainingApplication.java
+index e541a3d..1a9f9bd 100644
+--- a/src/main/java/com/fsoft/training/TrainingApplication.java
++++ b/src/main/java/com/fsoft/training/TrainingApplication.java
+@@ -1,13 +1,25 @@
+ package com.fsoft.training;
+ 
++import java.util.TimeZone;
+ import org.springframework.boot.SpringApplication;
+ import org.springframework.boot.autoconfigure.SpringBootApplication;
+ 
+ @SpringBootApplication
+ public class TrainingApplication {
+ 
+ 	public static void main(String[] args) {
++		normalizeLegacyTimeZone();
+ 		SpringApplication.run(TrainingApplication.class, args);
+ 	}
+ 
++	/**
++	 * Some JDKs (e.g. on Windows) report the legacy id "Asia/Saigon", which PostgreSQL 17 rejects
++	 * as a TimeZone startup parameter. Map it to its canonical id before any connection is opened.
++	 */
++	static void normalizeLegacyTimeZone() {
++		if ("Asia/Saigon".equals(TimeZone.getDefault().getID())) {
++			TimeZone.setDefault(TimeZone.getTimeZone("Asia/Ho_Chi_Minh"));
++		}
++	}
++
+ }
+diff --git a/src/main/java/com/fsoft/training/config/DataSourceConfig.java b/src/main/java/com/fsoft/training/config/DataSourceConfig.java
+index 9cb5b70..2e3a12a 100644
+--- a/src/main/java/com/fsoft/training/config/DataSourceConfig.java
++++ b/src/main/java/com/fsoft/training/config/DataSourceConfig.java
+@@ -22,20 +22,26 @@ public class DataSourceConfig {
+     public DataSourceProperties appDataSourceProperties() {
+         return new DataSourceProperties();
+     }
+ 
+     @Bean
+     @Primary
+     public DataSource appDataSource(@Qualifier("appDataSourceProperties") DataSourceProperties props) {
+         return props.initializeDataSourceBuilder().build();
+     }
+ 
++    @Bean
++    @Primary
++    public JdbcTemplate appJdbcTemplate(DataSource appDataSource) {
++        return new JdbcTemplate(appDataSource);
++    }
++
+     @Bean
+     @ConfigurationProperties("app.datasource.analyst")
+     public DataSourceProperties analystDataSourceProperties() {
+         return new DataSourceProperties();
+     }
+ 
+     @Bean
+     @Qualifier("analyst")
+     public DataSource analystDataSource(@Qualifier("analystDataSourceProperties") DataSourceProperties props) {
+         return props.initializeDataSourceBuilder().build();
+diff --git a/src/test/java/com/fsoft/training/warehouse/ChinookLoadTest.java b/src/test/java/com/fsoft/training/warehouse/ChinookLoadTest.java
+index 5c79ee6..ed07d21 100644
+--- a/src/test/java/com/fsoft/training/warehouse/ChinookLoadTest.java
++++ b/src/test/java/com/fsoft/training/warehouse/ChinookLoadTest.java
+@@ -1,28 +1,47 @@
+ package com.fsoft.training.warehouse;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
+ import com.fsoft.training.support.PostgresIntegrationTest;
+ import java.math.BigDecimal;
+ import org.junit.jupiter.api.Test;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.context.ApplicationContext;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.core.simple.JdbcClient;
+ 
+ class ChinookLoadTest extends PostgresIntegrationTest {
+ 
+     @Autowired
+     ApplicationContext ctx;
+ 
+     @Test
+     void chinookLoaded() {
+         assertThat(superuserJdbc().queryForObject("select count(*) from chinook.invoice", Long.class)).isEqualTo(412L);
+         assertThat(superuserJdbc().queryForObject("select count(*) from chinook.invoice_line", Long.class)).isEqualTo(2240L);
+         assertThat(superuserJdbc().queryForObject("select sum(total) from chinook.invoice", BigDecimal.class))
+                 .isEqualByComparingTo("2328.60");
+     }
+ 
++    @Autowired
++    JdbcClient jdbcClient;
++
++    @Autowired
++    JdbcTemplate defaultJdbcTemplate;
++
++    @Autowired
++    @org.springframework.beans.factory.annotation.Qualifier("analyst")
++    JdbcTemplate analystJdbcTemplate;
++
++    @Test
++    void defaultBeansRunAsAppRwAndAnalystAsAnalystRo() {
++        assertThat(jdbcClient.sql("select current_user").query(String.class).single()).isEqualTo("app_rw");
++        assertThat(defaultJdbcTemplate.queryForObject("select current_user", String.class)).isEqualTo("app_rw");
++        assertThat(analystJdbcTemplate.queryForObject("select current_user", String.class)).isEqualTo("analyst_ro");
++    }
++
+     @Test
+     void contextLoads() {
+         assertThat(ctx.getBean("analystJdbcTemplate")).isNotNull();
+     }
+ }

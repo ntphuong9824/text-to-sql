@@ -1,0 +1,87 @@
+# Review package: c0d6d4d..HEAD
+
+## Commits
+c1c5897 fix(semantic): explicit region value mapping rule and stricter renderer tests
+
+## Files changed
+ src/main/resources/semantic/semantic-layer.yaml       |  5 +++--
+ .../training/warehouse/SchemaPromptRendererTest.java  | 19 +++++++++++++++++++
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/src/main/resources/semantic/semantic-layer.yaml b/src/main/resources/semantic/semantic-layer.yaml
+index 505b58e..5d30479 100644
+--- a/src/main/resources/semantic/semantic-layer.yaml
++++ b/src/main/resources/semantic/semantic-layer.yaml
+@@ -26,21 +26,21 @@ tables:
+     columns:
+       - {name: customer_key, type: int, description: Customer id (PK)}
+       - {name: full_name, type: text, description: Customer first and last name, synonyms: [tên khách hàng, khách hàng]}
+       - {name: company, type: text, description: Company name (may be null), synonyms: [công ty]}
+       - {name: city, type: text, description: Customer city, synonyms: [thành phố]}
+       - {name: state, type: text, description: Customer state or province (may be null), synonyms: [bang, tỉnh]}
+       - {name: country, type: text, description: Customer country, synonyms: [quốc gia, nước], sampleValues: [USA, Canada, Brazil, France, Germany, United Kingdom, India, Australia]}
+       - name: region
+         type: text
+         description: "Sales region derived from country (4 values)"
+-        synonyms: [khu vực, vùng, Bắc Mỹ = North America, Châu Âu = Europe, Nam Mỹ = South America, Châu Á - Thái Bình Dương = Asia-Pacific]
++        synonyms: [khu vực, vùng, region]
+         sampleValues: [North America, South America, Asia-Pacific, Europe]
+   - name: dim_employee
+     description: Employee dimension (sales support reps and managers).
+     columns:
+       - {name: employee_key, type: int, description: Employee id (PK)}
+       - {name: full_name, type: text, description: Employee first and last name, synonyms: [nhân viên, tên nhân viên]}
+       - {name: title, type: text, description: Job title, synonyms: [chức danh], sampleValues: [General Manager, Sales Manager, Sales Support Agent, IT Manager, IT Staff]}
+       - {name: city, type: text, description: Employee city}
+       - {name: country, type: text, description: Employee country, sampleValues: [Canada]}
+   - name: dim_track
+@@ -73,11 +73,12 @@ metrics:
+   - name: customer_count
+     description: Number of distinct buying customers
+     sqlExpression: COUNT(DISTINCT f.customer_key)
+     synonyms: [số khách hàng, số lượng khách hàng]
+ 
+ rules:
+   - description: Chỉ dùng schema dw; luôn ghi tiền tố dw. trước tên bảng.
+   - description: Dùng alias f cho dw.fact_sales; join các bảng dim qua cột *_key.
+   - description: Câu hỏi không nêu năm thì gộp mọi năm (không lọc năm).
+   - description: Tháng/quý/năm lấy từ dw.dim_date qua fact_sales.date_key.
+-  - description: Khu vực lấy từ dw.dim_customer.region; giá trị chính xác là North America, South America, Asia-Pacific, Europe.
++  - description: Khu vực lấy từ dw.dim_customer.region.
++  - description: "Giá trị region: Bắc Mỹ → 'North America'; Nam Mỹ → 'South America'; Châu Âu → 'Europe'; Châu Á - Thái Bình Dương → 'Asia-Pacific'. Luôn dùng giá trị tiếng Anh trong SQL."
+diff --git a/src/test/java/com/fsoft/training/warehouse/SchemaPromptRendererTest.java b/src/test/java/com/fsoft/training/warehouse/SchemaPromptRendererTest.java
+index 197b2f8..ad55d76 100644
+--- a/src/test/java/com/fsoft/training/warehouse/SchemaPromptRendererTest.java
++++ b/src/test/java/com/fsoft/training/warehouse/SchemaPromptRendererTest.java
+@@ -15,11 +15,30 @@ class SchemaPromptRendererTest {
+ 
+     @Test
+     void containsSynonymsAndSampleValues() {
+         assertThat(out).contains("doanh thu", "North America", "Bắc Mỹ");
+     }
+ 
+     @Test
+     void containsRules() {
+         assertThat(out).contains("Câu hỏi không nêu năm thì gộp mọi năm", "Chỉ dùng schema dw");
+     }
++
++    @Test
++    void tableLineHasColumnShape() {
++        assertThat(out).containsPattern("dw\\.fact_sales\\(sales_key int -- [^,]+");
++        assertThat(out).containsPattern("revenue numeric -- unit_price \\* quantity; đồng nghĩa: doanh thu");
++    }
++
++    @Test
++    void sectionsAreOrdered() {
++        assertThat(out).contains("\nMetrics:\n", "\nRules:\n");
++        assertThat(out.indexOf("Metrics:")).isLessThan(out.indexOf("Rules:"));
++    }
++
++    @Test
++    void regionMappingIsExplicitAndNotInSynonyms() {
++        assertThat(out.lines().filter(l -> l.contains("Bắc Mỹ")))
++                .anyMatch(l -> l.contains("'North America'"));
++        assertThat(out).doesNotContain("Bắc Mỹ = North America");
++    }
+ }
