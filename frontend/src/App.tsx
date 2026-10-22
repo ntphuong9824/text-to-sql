@@ -1,4 +1,4 @@
-import { Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, RequireAuth } from './auth'
 import ChatPage from './pages/ChatPage'
 import LoginPage from './pages/LoginPage'
@@ -12,6 +12,7 @@ export default function App() {
         <Route path="/register" element={<RegisterPage />} />
         <Route path="/" element={<RequireAuth><ChatPage /></RequireAuth>} />
         <Route path="/c/:id" element={<RequireAuth><ChatPage /></RequireAuth>} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </AuthProvider>
   )
