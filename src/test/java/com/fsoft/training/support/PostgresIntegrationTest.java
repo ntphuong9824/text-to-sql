@@ -34,6 +34,9 @@ public abstract class PostgresIntegrationTest {
         registry.add("app.datasource.app.url", POSTGRES::getJdbcUrl);
         registry.add("app.datasource.analyst.url", POSTGRES::getJdbcUrl);
         registry.add("app.jwt.secret", () -> TEST_JWT_SECRET);
+        // application.yml imports a local .env; never let tests see a real key or reach the real endpoint.
+        registry.add("llm.api-key", () -> "");
+        registry.add("llm.base-url", () -> "http://127.0.0.1:9/");
     }
 
     protected JdbcTemplate superuserJdbc() {
